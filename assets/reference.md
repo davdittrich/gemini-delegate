@@ -48,7 +48,7 @@ Run the same prompt against two models simultaneously for adversarial review:
 echo "Review src/auth.py for security issues." | \
   python3 ~/.agents/skills/gemini-delegate/scripts/gemini_bridge.py \
   --cd "." --prompt-stdin \
-  --parallel-models "gemini-2.5-flash,gemini-2.5-pro"
+  --parallel-models "gemini-3-flash-preview,gemini-3.1-pro-preview"
 ```
 
 Output is a JSON array of results, one per model. Compare verdicts — disagreements indicate areas needing human review.
@@ -66,15 +66,15 @@ YYYY-MM-DD HH:MM | MODEL                | TASK_TYPE    | VERDICT  | EST_TOK | NO
 
 **CLI shortcut**:
 ```bash
-python3 gemini_bridge.py --cd "." --model gemini-2.5-flash \
+python3 gemini_bridge.py --cd "." --model gemini-3-flash-preview \
   --log-feedback "accepted|diff-review|1.2k|clean, no issues found"
 ```
 
 **Examples**:
 ```
-2026-04-02 14:30 | gemini-2.5-flash     | diff-review  | accepted | 1.2k   | clean, no issues found
-2026-04-02 15:10 | gemini-2.5-pro       | arch-review  | partial  | 8.4k   | hallucinated a nonexistent API method
-2026-04-02 16:45 | gemini-2.5-pro       | debug        | rejected | 12k    | completely wrong diagnosis
+2026-04-02 14:30 | gemini-3-flash-preview | diff-review  | accepted | 1.2k   | clean, no issues found
+2026-04-02 15:10 | gemini-3.1-pro-preview | arch-review  | partial  | 8.4k   | hallucinated a nonexistent API method
+2026-04-02 16:45 | gemini-3.1-pro-preview | debug        | rejected | 12k    | completely wrong diagnosis
 ```
 
 **Verdicts**: `accepted` (used as-is), `partial` (useful but needed correction), `rejected` (wrong, discarded).

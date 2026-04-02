@@ -217,8 +217,8 @@ def _estimate_tokens(text: str) -> int:
 # Pricing per 1M tokens (USD) -- update when prices change.
 # Source: https://ai.google.dev/pricing as of 2026-04.
 _MODEL_PRICING = {
-    "gemini-2.5-flash": {"input": 0.15, "output": 0.60},
-    "gemini-2.5-pro":   {"input": 1.25, "output": 10.00},
+    "gemini-3-flash-preview": {"input": 0.15, "output": 0.60},
+    "gemini-3.1-pro-preview":   {"input": 1.25, "output": 10.00},
     # Fallback for unknown models
     "default":          {"input": 1.25, "output": 10.00},
 }
@@ -731,7 +731,7 @@ async def _run_parallel(args: argparse.Namespace, prompt_text: str) -> Dict[str,
     """Run N parallel ACP sessions, potentially with different models.
 
     --parallel-models: comma-separated list of models.
-    Example: --parallel-models gemini-2.5-flash,gemini-2.5-pro
+    Example: --parallel-models gemini-3-flash-preview,gemini-3.1-pro-preview
     Each model gets its own ACP session with the same prompt.
     Temp session directories are cleaned up in a finally block.
     """
@@ -897,7 +897,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--clear-cache", action="store_true",
                         help="Clear the result cache and exit.")
     parser.add_argument("--parallel-models",
-                        help="Comma-separated models for parallel execution (e.g., 'gemini-2.5-flash,gemini-2.5-pro').")
+                        help="Comma-separated models for parallel execution (e.g., 'gemini-3-flash-preview,gemini-3.1-pro-preview').")
     parser.add_argument("--log-feedback",
                         help="Append a feedback entry. Format: 'VERDICT|TASK_TYPE|EST_TOKENS|NOTE'. "
                              "Example: 'accepted|review|1.2k|clean review'. "

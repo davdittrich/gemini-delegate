@@ -48,16 +48,16 @@ Before EVERY delegation:
 
 | Task | Template | Model | Est. tokens |
 |---|---|---|---|
-| Diff review (<100 lines changed) | Focused diff review | `gemini-2.5-flash` | 500-2k |
-| Code review (single file, <200 lines) | Review | `gemini-2.5-flash` | 1k-3k |
-| Multi-file / architectural review | Tool-assisted review | `gemini-2.5-pro` | 2k-8k |
-| Architecture analysis | Analysis / Plan | `gemini-2.5-pro` | 3k-10k |
-| Bug diagnosis (>3 files) | Tool-assisted review | `gemini-2.5-pro` | 2k-8k |
-| Web search / current info | Web search | `gemini-2.5-flash` | 1k-3k |
-| Generate a patch (single file) | Patch | `gemini-2.5-flash` | 1k-4k |
-| Adversarial plan critique | Plan review | `gemini-2.5-pro` | 2k-5k |
-| Novel algorithm design | Analysis / Plan | `gemini-2.5-pro` | 3k-10k |
-| File reads, grep, enumeration | Analysis / Plan | `gemini-2.5-flash` | 500-2k |
+| Diff review (<100 lines changed) | Focused diff review | `gemini-3-flash-preview` | 500-2k |
+| Code review (single file, <200 lines) | Review | `gemini-3-flash-preview` | 1k-3k |
+| Multi-file / architectural review | Tool-assisted review | `gemini-3.1-pro-preview` | 2k-8k |
+| Architecture analysis | Analysis / Plan |  `gemini-3.1-pro-preview` | 3k-10k |
+| Bug diagnosis (>3 files) | Tool-assisted review |  `gemini-3.1-pro-preview` | 2k-8k |
+| Web search / current info | Web search |  `gemini-3-flash-preview` | 1k-3k |
+| Generate a patch (single file) | Patch |  `gemini-3-flash-preview` | 1k-4k |
+| Adversarial plan critique | Plan review |  `gemini-3.1-pro-preview` | 2k-5k |
+| Novel algorithm design | Analysis / Plan |  `gemini-3.1-pro-preview` | 3k-10k |
+| File reads, grep, enumeration | Analysis / Plan |  `gemini-3-flash-preview` | 500-2k |
 
 ## When to delegate
 
@@ -109,7 +109,7 @@ After verifying output, log the outcome via `--log-feedback "VERDICT|TASK_TYPE|E
   "token_estimate": {
     "input_tokens": 1250,
     "output_tokens": 340,
-    "model": "gemini-2.5-flash",
+    "model": "gemini-3-flash-preview",
     "estimated_cost_usd": 0.000391,
     "note": "Estimate only. Actual billing may differ."
   }
