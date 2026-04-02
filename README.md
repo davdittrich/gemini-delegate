@@ -16,7 +16,8 @@ Claude Code sends prompts to Gemini CLI over a typed JSON-RPC channel. Gemini's 
 - **Permission control** -- Read-only by default. Writes require explicit `--approve-edits` flag, scoped to workspace root.
 - **Path containment** -- All file operations restricted to `--cd` directory. Traversal attempts rejected.
 - **Terminal blocked** -- Gemini cannot execute shell commands through the bridge.
-- **Multi-turn sessions** -- Session IDs auto-persisted per project. Expired sessions fall back gracefully.
+- **Multi-turn sessions** -- Session IDs auto-persisted per project using hashed identifiers.
+- **Concurrency & Isolation** -- Shredded session storage and explicit isolation flags for multi-agent workflows.
 - **Crash recovery** -- Process crashes produce valid JSON output (`stop_reason: "crash"`), never raw tracebacks.
 - **Timeout + cancellation** -- Graceful `session/cancel` with hard-kill fallback.
 
@@ -58,7 +59,7 @@ gemini --version   # Should be >= 0.36.0
 gemini -p "Hello"  # Should get a response
 ```
 
-No additional configuration needed. Session state is stored at `~/.cache/gemini-bridge/sessions.json`.
+No additional configuration needed. Session state is stored in `~/.cache/gemini-bridge/sessions/` (XDG compliant).
 
 ## Usage
 
@@ -69,12 +70,16 @@ python3 ~/.agents/skills/gemini-delegate/scripts/gemini_bridge.py \
   --cd "." --prompt "Review src/auth.py around login() and propose fixes."
 ```
 
-### Prompt from file (recommended for complex prompts)
+### Automation & Concurrency (Recommended)
+Use `--prompt-stdin` and `--output-file AUTO` to avoid temporary file collisions:
 
 ```bash
-python3 ~/.agents/skills/gemini-delegate/scripts/gemini_bridge.py \
-  --cd "." --prompt-file /tmp/review_prompt.txt
+echo "Review the architecture of src/" | \
+  python3 ~/.agents/skills/gemini-delegate/scripts/gemini_bridge.py \
+  --cd "." --prompt-stdin --output-file AUTO
 ```
+
+**Note**: `AUTO` generates a unique, private (`0600`) JSON file in `/tmp`.
 
 ### Multi-turn session
 
@@ -88,34 +93,30 @@ python3 ~/.agents/skills/gemini-delegate/scripts/gemini_bridge.py \
   --cd "." --session-id "<SESSION_ID>" --prompt "Propose a fix."
 ```
 
-### Allow file writes
+### Isolation for Multiple Agents
+When running independent agents in the same project, isolate their states:
 
 ```bash
-python3 ~/.agents/skills/gemini-delegate/scripts/gemini_bridge.py \
-  --cd "." --prompt "Fix the typo in README.md" --approve-edits
-```
-
-### Extract structured JSON from response
-
-```bash
-python3 ~/.agents/skills/gemini-delegate/scripts/gemini_bridge.py \
-  --cd "." --prompt-file /tmp/review.txt --parse-json
+export GEMINI_BRIDGE_SESSIONS_DIR="/tmp/agent-alpha-cache"
+python3 gemini_bridge.py --cd "." --prompt "..."
 ```
 
 ## CLI Flags
 
 | Flag | Description |
 |---|---|
-| `--prompt` / `--PROMPT` | Prompt text |
-| `--prompt-file` | Read prompt from file (mutually exclusive with `--prompt`) |
-| `--session-id` / `--SESSION_ID` | Resume a specific session |
-| `--new-session` | Force fresh session (mutually exclusive with `--session-id`) |
+| `--prompt` | Prompt text |
+| `--prompt-file` | Read prompt from file |
+| `--prompt-stdin` | Read prompt from stdin (Preferred for automation) |
+| `--session-id` | Resume a specific session |
+| `--new-session` | Force fresh session |
+| `--sessions-dir` | Override session storage directory |
 | `--cd` | Workspace root directory (required) |
 | `--sandbox` | Run Gemini in sandbox mode |
 | `--model` | Override the Gemini model |
 | `--timeout` | Max seconds (default: 300) |
 | `--parse-json` | Extract JSON from response text |
-| `--output-file` | Write result JSON to file |
+| `--output-file` | Write result JSON to file (or `AUTO` for unique temp file) |
 | `--return-all-messages` | Include raw ACP events in output |
 | `--approve-edits` | Allow scoped file writes |
 
@@ -133,22 +134,10 @@ python3 ~/.agents/skills/gemini-delegate/scripts/gemini_bridge.py \
   "stop_reason": "end_turn",
   "plan": [{"content": "Read the file", "status": "completed"}],
   "error": null,
-  "parsed_json": {}
+  "parsed_json": {},
+  "AUTO_OUTPUT_FILE": "/tmp/gemini_bridge_res_xyz.json"
 }
 ```
-
-### stop_reason values
-
-| Value | Source | Meaning |
-|---|---|---|
-| `end_turn` | SDK | Normal completion |
-| `max_tokens` | SDK | Token limit reached -- continue session |
-| `max_turn_requests` | SDK | Turn limit reached -- continue session |
-| `cancelled` | SDK | Cancelled by client |
-| `refusal` | SDK | Gemini refused the request |
-| `timeout` | Bridge | `--timeout` exceeded |
-| `crash` | Bridge | Gemini process exited unexpectedly |
-| `error` | Bridge | ACP protocol or unexpected error |
 
 ## Permission Model
 
@@ -160,43 +149,20 @@ python3 ~/.agents/skills/gemini-delegate/scripts/gemini_bridge.py \
 
 Path containment uses `Path.resolve()` + `is_relative_to()`. Symlink traversal is prevented.
 
-## Prompt Templates
-
-See `assets/prompt-template.md` for 8 ready-to-use templates:
-
-- Analysis / Plan
-- Patch (Unified Diff)
-- Review (audit a diff)
-- Tool-assisted review (ACP -- Gemini reads files directly)
-- Pre-action audit (benchmark completeness)
-- Fix regression-safety check
-- Web search
-- Plan review (adversarial, structured JSON)
-
 ## Running Tests
 
 ```bash
 cd ~/.agents/skills/gemini-delegate
-python3 -m pytest scripts/test_acp.py -v
-```
-
-Unit tests (T1-T10) run with mocked ACP -- no Gemini connection needed. Integration tests (T11-T12) require a live Gemini CLI and are gated:
-
-```bash
-GEMINI_INTEGRATION_TEST=1 python3 -m pytest scripts/test_acp.py -v
+python3 scripts/test_acp.py
 ```
 
 ## Architecture
 
-The bridge implements the ACP `Client` protocol with 12 methods, communicating with `gemini --acp` over JSON-RPC 2.0 on stdio:
+The bridge implements the ACP `Client` protocol with 12 methods, communicating with `gemini --acp` over JSON-RPC 2.0 on stdio.
 
-- 3 core methods: `read_text_file`, `write_text_file`, `request_permission`
-- 5 terminal stubs (all reject -- defense in depth)
-- 2 extension stubs (`ext_method` rejects, `ext_notification` ignores)
-- `session_update` (accumulates streaming chunks)
-- `on_connect` (stores connection reference)
-
-Session lifecycle: `spawn_agent_process` (async context manager) -> `initialize` -> `new_session` / `load_session` -> `prompt` -> streaming `session_update` notifications -> `PromptResponse`.
+- **Shredded Sessions**: Uses hashed project paths to isolate session persistence.
+- **Atomic Updates**: Uses `os.replace` + `tempfile` for thread-safe state persistence.
+- **Secure Defaults**: Enforces `0o700` on cache directories and `0o600` on temporary results.
 
 ## License
 
