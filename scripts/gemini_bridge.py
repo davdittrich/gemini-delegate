@@ -245,7 +245,7 @@ def _estimate_cost(input_tokens: int, output_tokens: int, model: str) -> dict:
 
 def _sanitize_log_field(value: str) -> str:
     """Strip newlines and carriage returns to prevent log injection."""
-    return value.replace("\n", " ").replace("\r", " ")
+    return value.replace("\n", " ").replace("\r", " ").replace("|", "-")
 
 
 def _write_feedback(cd: Path, feedback_str: str, model: str) -> None:
@@ -269,7 +269,7 @@ def _write_feedback(cd: Path, feedback_str: str, model: str) -> None:
     log_file = log_dir / "feedback.log"
 
     timestamp = _datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-    entry = f"{timestamp} | {model:<6} | {task_type:<12} | {verdict:<8} | {est_tokens:<6} | {note}\n"
+    entry = f"{timestamp} | {model:<20} | {task_type:<12} | {verdict:<8} | {est_tokens:<6} | {note}\n"
 
     # Open with restricted permissions
     fd = os.open(log_file, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
@@ -309,7 +309,7 @@ def _get_session_path(sessions_dir: Path, project_path: str) -> Path:
     path_hash = hashlib.sha256(resolved_path.encode("utf-8")).hexdigest()[:16]
     basename = Path(project_path).name or "root"
     # Ensure basename is safe for filenames
-    safe_basename = re.sub(r"[^a-zA-Z0-0_\-]", "_", basename)
+    safe_basename = re.sub(r"[^a-zA-Z0-9_\-]", "_", basename)
     return sessions_dir / f"{safe_basename}_{path_hash}.json"
 
 
@@ -553,16 +553,16 @@ CAPABILITIES = ClientCapabilities(
 async def _run_acp(args: argparse.Namespace, prompt_text: str) -> Dict[str, Any]:
     cd: Path = args.cd.resolve()
     project_path = cd.as_posix()
+    model_name = args.model or "default"
 
     # --- Cache check (before any ACP work) ---
     cache_d: Optional[Path] = None
     cache_key_str: Optional[str] = None
-    if getattr(args, "cache", False):
-        cache_ttl = getattr(args, "cache_ttl", DEFAULT_CACHE_TTL)
+    if args.cache:
+        cache_ttl = args.cache_ttl
         if cache_ttl < 1 or cache_ttl > 2592000:
             cache_ttl = DEFAULT_CACHE_TTL
         cache_d = _ensure_dir(DEFAULT_CACHE_DIR)
-        model_name = args.model or "default"
         cache_key_str = _cache_key(prompt_text, project_path, model_name)
         cached = _cache_lookup(cache_d, cache_key_str, cache_ttl)
         if cached is not None:
@@ -705,7 +705,6 @@ async def _run_acp(args: argparse.Namespace, prompt_text: str) -> Dict[str, Any]
     result["agent_messages"] = client._agent_messages
     result["tool_calls"] = client._tool_calls
     # Token estimation
-    model_name = args.model or "default"
     input_tokens = _estimate_tokens(prompt_text)
     output_tokens = _estimate_tokens(client._agent_messages)
     result["token_estimate"] = _estimate_cost(input_tokens, output_tokens, model_name)
@@ -917,8 +916,8 @@ def main() -> None:
     # --- Canonical argument validation (covers all early-exit flags) ---
     has_prompt = bool(args.prompt or args.prompt_file or args.prompt_stdin)
     has_early_exit = (
-        getattr(args, "clear_cache", False)
-        or getattr(args, "log_feedback", None)
+        args.clear_cache
+        or args.log_feedback
     )
     if not has_prompt and not has_early_exit:
         print(json.dumps({
@@ -928,7 +927,7 @@ def main() -> None:
         }))
         return
 
-    if getattr(args, "clear_cache", False):
+    if args.clear_cache:
         cache_path = DEFAULT_CACHE_DIR
         if cache_path.exists():
             count = len(list(cache_path.glob("*.json")))
@@ -954,6 +953,10 @@ def main() -> None:
         prompt_text = args.prompt_file.read_text(encoding="utf-8")
     else:
         prompt_text = args.prompt
+
+    if prompt_text is None:
+        print(json.dumps({"success": False, "error": "No prompt text provided."}))
+        return
 
     if args.parallel_models:
         result = asyncio.run(_run_parallel(args, prompt_text))

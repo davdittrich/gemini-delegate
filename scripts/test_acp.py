@@ -110,16 +110,21 @@ class TestSessionIsolation(unittest.TestCase):
     def test_save_and_load_session(self):
         project = str(self.tmpdir / "proj")
         session_path = _get_session_path(self.sessions_dir, project)
-        
+
         _save_session(session_path, project, "sess-123")
-        
+
         # Verify permissions
         self.assertEqual(os.stat(session_path).st_mode & 0o777, 0o600)
         self.assertEqual(os.stat(self.sessions_dir).st_mode & 0o777, 0o700)
-        
+
         # Load back
         loaded = _load_session(session_path, project)
         self.assertEqual(loaded, "sess-123")
+
+    def test_hashed_filename_preserves_digits(self):
+        """Digits 1-9 in project names should not be replaced with underscores."""
+        path = _get_session_path(self.sessions_dir, "/tmp/project-v2")
+        self.assertIn("project-v2", path.name)
 
 
 class TestBridgeFeatures(unittest.TestCase):
@@ -169,8 +174,11 @@ class TestResultCache(unittest.TestCase):
     def test_cache_expired_returns_none(self):
         key = "expired-key"
         _cache_store(self.cache_dir, key, {"success": True})
-        # TTL of 0 means immediately expired
-        result = _cache_lookup(self.cache_dir, key, cache_ttl=0)
+        # Backdate the file to guarantee expiry
+        cache_file = self.cache_dir / f"{key}.json"
+        old_time = time.time() - 100  # 100 seconds in the past
+        os.utime(cache_file, (old_time, old_time))
+        result = _cache_lookup(self.cache_dir, key, cache_ttl=10)
         self.assertIsNone(result)
 
     def test_cache_permissions(self):
@@ -273,6 +281,22 @@ class TestFeedbackLog(unittest.TestCase):
         log_dir = self.tmpdir / ".gemini-bridge"
         self.assertEqual(os.stat(log_dir).st_mode & 0o777, 0o700)
 
+    def test_write_feedback_sanitizes_pipes_in_model(self):
+        """Pipe characters in model field must be stripped to prevent column corruption."""
+        _write_feedback(self.tmpdir, "accepted|review|1k|test", "flash|injected")
+        log_file = self.tmpdir / ".gemini-bridge" / "feedback.log"
+        content = log_file.read_text()
+        self.assertIn("flash-injected", content)
+        self.assertNotIn("flash|injected", content)
+
+    def test_write_feedback_full_model_name_alignment(self):
+        """Full model names (e.g., gemini-2.5-flash) should not corrupt column structure."""
+        _write_feedback(self.tmpdir, "accepted|review|1k|test", "gemini-2.5-flash")
+        log_file = self.tmpdir / ".gemini-bridge" / "feedback.log"
+        content = log_file.read_text()
+        self.assertIn("gemini-2.5-flash", content)
+        self.assertIn("| accepted", content)
+
 
 class TestParallelExecution(unittest.TestCase):
     """Test parallel execution setup and argument routing."""
@@ -293,7 +317,9 @@ class TestParallelExecution(unittest.TestCase):
             sys.argv = sys_argv_backup
 
     def test_parallel_model_args_isolation(self):
-        """Verify each model gets its own args copy with correct .model."""
+        """Verify copy.copy produces isolated args per model.
+        Note: Tests the isolation mechanism directly rather than through _run_parallel,
+        which requires a live ACP connection. See _run_parallel for the actual usage."""
         import copy
         class FakeArgs:
             parallel_models = "flash,pro"
