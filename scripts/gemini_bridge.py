@@ -8,6 +8,7 @@ Replaces the previous stream-json transport with structured, typed communication
 
 import argparse
 import asyncio
+import enum
 import hashlib
 import json
 import os
@@ -15,6 +16,7 @@ import re
 import shutil
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -34,6 +36,73 @@ from acp.schema import (
     ToolCallUpdate,
     TextContentBlock,
 )
+
+# ---------------------------------------------------------------------------
+# Timeouts and Watchdog
+# ---------------------------------------------------------------------------
+class TimeoutType(enum.Enum):
+    CONNECT = "Connect Timeout"
+    INITIAL_IDLE = "Initial Idle Timeout"
+    SUBSEQUENT_IDLE = "Subsequent Idle Timeout"
+    TOTAL = "Total Timeout"
+
+
+class BridgeTimeoutError(Exception):
+    def __init__(self, timeout_type: TimeoutType, threshold: float, elapsed: float):
+        self.timeout_type = timeout_type
+        self.threshold = threshold
+        self.elapsed = elapsed
+        msg = f"{timeout_type.value}: {elapsed:.1f}s elapsed (Threshold: {threshold:.1f}s)"
+        super().__init__(msg)
+
+
+class HeartbeatWatchdog:
+    """Monitors activity and raises BridgeTimeoutError if thresholds are exceeded."""
+
+    def __init__(self, total_limit: float, initial_idle: float, subsequent_idle: float, verbose: bool = False):
+        self.total_limit = total_limit
+        self.initial_idle = initial_idle
+        self.subsequent_idle = subsequent_idle
+        self.verbose = verbose
+        
+        self.start_time = time.monotonic()
+        self.last_activity = self.start_time
+        self.has_had_activity = False
+        self.last_log_time = 0.0
+
+    def activity(self, label: str = "activity"):
+        now = time.monotonic()
+        self.last_activity = now
+        self.has_had_activity = True
+        
+        if self.verbose and now - self.last_log_time > 0.5:
+            elapsed = now - self.start_time
+            print(f"[bridge] Heartbeat reset @ {elapsed:.1f}s: {label}", file=sys.stderr)
+            self.last_log_time = now
+
+    async def monitor(self):
+        """Async loop that checks for timeout conditions."""
+        while True:
+            await asyncio.sleep(1)
+            now = time.monotonic()
+            elapsed = now - self.start_time
+            
+            # 1. Check Total Limit
+            if elapsed > self.total_limit:
+                raise BridgeTimeoutError(TimeoutType.TOTAL, self.total_limit, elapsed)
+            
+            # 2. Check Idle Limits
+            if not self.has_had_activity:
+                if now - self.start_time > self.initial_idle:
+                    raise BridgeTimeoutError(TimeoutType.INITIAL_IDLE, self.initial_idle, elapsed)
+            else:
+                idle_time = now - self.last_activity
+                if idle_time > self.subsequent_idle:
+                    raise BridgeTimeoutError(TimeoutType.SUBSEQUENT_IDLE, self.subsequent_idle, elapsed)
+            
+            if self.verbose and int(elapsed) % 30 == 0:
+                print(f"[bridge] Progress: {elapsed:.0f}s elapsed...", file=sys.stderr)
+
 
 # ---------------------------------------------------------------------------
 # Session persistence (Shredded/Hashed approach)
@@ -145,9 +214,10 @@ def extract_json(text: str) -> Tuple[Optional[Any], Optional[str]]:
 class BridgeClient:
     """Implements the ACP Client protocol (12 methods)."""
 
-    def __init__(self, cwd: str, approve_edits: bool = False):
+    def __init__(self, cwd: str, approve_edits: bool = False, watchdog: Optional[HeartbeatWatchdog] = None):
         self._cwd = cwd
         self._approve_edits = approve_edits
+        self._watchdog = watchdog
         self._conn = None
         self._agent_messages = ""
         self._thoughts = ""
@@ -223,9 +293,11 @@ class BridgeClient:
         if isinstance(update, AgentMessageChunk):
             if isinstance(update.content, TextContentBlock):
                 self._agent_messages += update.content.text
+                if self._watchdog: self._watchdog.activity("AgentMessageChunk")
         elif isinstance(update, AgentThoughtChunk):
             if isinstance(update.content, TextContentBlock):
                 self._thoughts += update.content.text
+                if self._watchdog: self._watchdog.activity("AgentThoughtChunk")
         elif isinstance(update, ToolCallStart):
             path = None
             if update.locations:
@@ -237,6 +309,7 @@ class BridgeClient:
                 "status": getattr(update, "status", "pending"),
                 "path": path,
             })
+            if self._watchdog: self._watchdog.activity("ToolCallStart")
         elif isinstance(update, ToolCallUpdate):
             for tc in self._tool_calls:
                 if tc["id"] == update.tool_call_id:
@@ -300,24 +373,9 @@ CAPABILITIES = ClientCapabilities(
 # ---------------------------------------------------------------------------
 # ACP transport
 # ---------------------------------------------------------------------------
-async def _run_acp(args: argparse.Namespace) -> Dict[str, Any]:
+async def _run_acp(args: argparse.Namespace, prompt_text: str) -> Dict[str, Any]:
     cd: Path = args.cd.resolve()
     project_path = cd.as_posix()
-
-    # Determine prompt
-    prompt_text: Optional[str] = None
-    if args.prompt_stdin:
-        # Read from stdin BEFORE spawning process to avoid deadlocks
-        prompt_text = sys.stdin.read()
-    elif args.prompt_file is not None:
-        if not args.prompt_file.exists():
-            return {"success": False, "error": f"Prompt file `{args.prompt_file}` does not exist."}
-        prompt_text = args.prompt_file.read_text(encoding="utf-8")
-    elif args.prompt:
-        prompt_text = args.prompt
-    
-    if not prompt_text:
-        return {"success": False, "error": "No prompt provided."}
 
     # Session resolution
     sessions_dir = _get_sessions_dir(args)
@@ -338,7 +396,14 @@ async def _run_acp(args: argparse.Namespace) -> Dict[str, Any]:
     if args.model:
         extra_flags.extend(["--model", args.model])
 
-    client = BridgeClient(cwd=cd.as_posix(), approve_edits=args.approve_edits)
+    watchdog = HeartbeatWatchdog(
+        total_limit=args.timeout,
+        initial_idle=args.first_chunk_timeout,
+        subsequent_idle=args.idle_timeout,
+        verbose=args.verbose
+    )
+    
+    client = BridgeClient(cwd=cd.as_posix(), approve_edits=args.approve_edits, watchdog=watchdog)
     result: Dict[str, Any] = {}
     session_id: Optional[str] = None
 
@@ -348,53 +413,88 @@ async def _run_acp(args: argparse.Namespace) -> Dict[str, Any]:
             "gemini", "--acp", *extra_flags,
             env=os.environ.copy(),
         ) as (conn, proc):
-            await conn.initialize(
-                protocol_version=PROTOCOL_VERSION,
-                client_capabilities=CAPABILITIES,
-            )
-
-            # Session: resume or new
-            if resume_id:
-                try:
-                    await conn.load_session(
-                        cwd=cd.as_posix(),
-                        session_id=resume_id,
-                        mcp_servers=[],
+            # 1. Connect Phase (Isolated)
+            try:
+                await asyncio.wait_for(
+                    conn.initialize(
+                        protocol_version=PROTOCOL_VERSION,
+                        client_capabilities=CAPABILITIES,
+                    ),
+                    timeout=60.0
+                )
+                
+                # Session: resume or new
+                if resume_id:
+                    try:
+                        await asyncio.wait_for(
+                            conn.load_session(
+                                cwd=cd.as_posix(),
+                                session_id=resume_id,
+                                mcp_servers=[],
+                            ),
+                            timeout=60.0
+                        )
+                        session_id = resume_id
+                    except (RequestError, asyncio.TimeoutError):
+                        session = await asyncio.wait_for(
+                            conn.new_session(cwd=cd.as_posix(), mcp_servers=[]),
+                            timeout=60.0
+                        )
+                        session_id = session.session_id
+                        _save_session(session_path, project_path, session_id)
+                else:
+                    session = await asyncio.wait_for(
+                        conn.new_session(cwd=cd.as_posix(), mcp_servers=[]),
+                        timeout=60.0
                     )
-                    session_id = resume_id
-                except RequestError:
-                    session = await conn.new_session(cwd=cd.as_posix(), mcp_servers=[])
                     session_id = session.session_id
                     _save_session(session_path, project_path, session_id)
-            else:
-                session = await conn.new_session(cwd=cd.as_posix(), mcp_servers=[])
-                session_id = session.session_id
-                _save_session(session_path, project_path, session_id)
+            except asyncio.TimeoutError:
+                raise BridgeTimeoutError(TimeoutType.CONNECT, 60.0, 60.0)
 
-            # Prompt with timeout
-            timeout = args.timeout
-            try:
-                response = await asyncio.wait_for(
-                    conn.prompt(
-                        session_id=session_id,
-                        prompt=[text_block(prompt_text)],
-                    ),
-                    timeout=timeout,
-                )
+            # 2. Progress Race (Prompt Phase)
+            watchdog_task = asyncio.create_task(watchdog.monitor())
+            prompt_task = asyncio.create_task(conn.prompt(
+                session_id=session_id,
+                prompt=[text_block(prompt_text)],
+            ))
+            
+            done, pending = await asyncio.wait(
+                [prompt_task, watchdog_task],
+                return_when=asyncio.FIRST_COMPLETED
+            )
+            
+            # Cleanup pending
+            for task in pending:
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            
+            if prompt_task in done:
+                response = await prompt_task
                 result["stop_reason"] = response.stop_reason
                 result["success"] = True
-            except asyncio.TimeoutError:
-                try:
-                    await conn.cancel(session_id=session_id)
-                    await asyncio.sleep(5)
-                except Exception:
-                    pass
-                if proc.returncode is None:
-                    proc.kill()
-                result["success"] = False
-                result["stop_reason"] = "timeout"
-                result["error"] = f"Gemini CLI timed out after {timeout:.0f} seconds."
+            else:
+                # Watchdog won the race
+                await watchdog_task # Re-raises BridgeTimeoutError
 
+    except BridgeTimeoutError as e:
+        result["success"] = False
+        result["stop_reason"] = "timeout"
+        result["error"] = str(e)
+        # Attempt cleanup (cancel -> kill -> wait)
+        if session_id and 'conn' in locals():
+            try:
+                await asyncio.wait_for(conn.cancel(session_id=session_id), timeout=2.0)
+            except Exception:
+                pass
+        if 'proc' in locals():
+            if proc.returncode is None:
+                proc.kill()
+                await proc.wait()
+                
     except (BrokenPipeError, EOFError, ConnectionResetError, asyncio.IncompleteReadError) as e:
         result["success"] = False
         result["stop_reason"] = "crash"
@@ -462,9 +562,6 @@ def _emit(result: Dict[str, Any], args: argparse.Namespace) -> None:
                 f.write(output)
                 resolved = Path(f.name).resolve()
             
-            # Update result with the auto path for the user to see in the JSON
-            # Note: The 'print(output)' above already fired, so this is for the file itself
-            # and potentially for stderr communication.
             print(f"[bridge] Result saved to {resolved} (0600 permissions). Manual cleanup recommended.", file=sys.stderr)
             result["AUTO_OUTPUT_FILE"] = str(resolved)
         else:
@@ -508,8 +605,14 @@ def _parse_args() -> argparse.Namespace:
                         help="Run Gemini in sandbox mode.")
     parser.add_argument("--model", default="",
                         help="Override the Gemini model.")
-    parser.add_argument("--timeout", type=float, default=300.0,
-                        help="Max wall-clock seconds (default: 300).")
+    parser.add_argument("--timeout", type=float, default=600.0,
+                        help="Total max wall-clock seconds (default: 600).")
+    parser.add_argument("--idle-timeout", type=float, default=120.0,
+                        help="Max seconds between message chunks (default: 120).")
+    parser.add_argument("--first-chunk-timeout", type=float, default=300.0,
+                        help="Max seconds for the first response chunk (default: 300).")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Print heartbeat and progress markers to stderr.")
     parser.add_argument("--parse-json", action="store_true",
                         help="Extract JSON from agent_messages.")
     parser.add_argument("--output-file",
@@ -535,7 +638,16 @@ def main() -> None:
         print(json.dumps({"success": False, "error": f"Workspace `{args.cd.resolve()}` does not exist."}))
         return
 
-    result = asyncio.run(_run_acp(args))
+    # Pre-read prompt to avoid deadlocks
+    prompt_text: Optional[str] = None
+    if args.prompt_stdin:
+        prompt_text = sys.stdin.read()
+    elif args.prompt_file:
+        prompt_text = args.prompt_file.read_text(encoding="utf-8")
+    else:
+        prompt_text = args.prompt
+
+    result = asyncio.run(_run_acp(args, prompt_text))
     _emit(result, args)
 
 

@@ -48,6 +48,17 @@ echo "Review the architecture of src/" | \
 
 **Note**: `--output-file AUTO` generates a unique, private (`0600`) JSON file in `/tmp`.
 
+## Progress-Aware Timeouts (Heartbeat)
+
+The bridge uses a **Heartbeat Watchdog** to handle long-running reasoning tasks:
+
+- **Connect Timeout (60s)**: Handshake and session loading.
+- **Initial Idle (300s)**: Time allowed for Gemini to start its first response chunk.
+- **Subsequent Idle (120s)**: Max time allowed between response chunks.
+- **Total Timeout (600s)**: Absolute hard cap for the entire operation.
+
+Adjust these via `--first-chunk-timeout`, `--idle-timeout`, and `--timeout`.
+
 ## Multi-turn sessions
 
 ```bash
@@ -86,7 +97,10 @@ Alternatively, use the `--sessions-dir` flag. Precedence: **Flag > Environment V
 | `--cd` | Workspace root directory (required) |
 | `--sandbox` | Run Gemini in sandbox mode |
 | `--model` | Override the Gemini model |
-| `--timeout` | Max seconds (default: 300) |
+| `--timeout` | Total max wall-clock seconds (default: 600) |
+| `--idle-timeout` | Max seconds between chunks (default: 120) |
+| `--first-chunk-timeout` | Max seconds for first chunk (default: 300) |
+| `--verbose` | Print heartbeat markers to stderr |
 | `--parse-json` | Extract JSON from `agent_messages` |
 | `--output-file` | Write result JSON to file (or `AUTO` for unique temp file) |
 | `--return-all-messages` | Include raw ACP events in output |
