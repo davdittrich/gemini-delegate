@@ -8,12 +8,15 @@ Replaces the previous stream-json transport with structured, typed communication
 
 import argparse
 import asyncio
+import copy
+import datetime as _datetime
 import enum
 import hashlib
 import json
 import os
 import re
 import shutil
+import subprocess as _subprocess
 import sys
 import tempfile
 import time
@@ -108,6 +111,180 @@ class HeartbeatWatchdog:
 # Session persistence (Shredded/Hashed approach)
 # ---------------------------------------------------------------------------
 DEFAULT_SESSIONS_DIR = Path(os.getenv("XDG_CACHE_HOME", Path.home() / ".cache")) / "gemini-bridge" / "sessions"
+
+
+# ---------------------------------------------------------------------------
+# Result Caching
+# ---------------------------------------------------------------------------
+DEFAULT_CACHE_DIR = Path(os.getenv("XDG_CACHE_HOME", Path.home() / ".cache")) / "gemini-bridge" / "result-cache"
+DEFAULT_CACHE_TTL = 86400  # 24 hours
+
+
+def _ensure_dir(path: Path, mode: int = 0o700) -> Path:
+    """Create directory with correct permissions, handling umask race."""
+    os.makedirs(path, mode=mode, exist_ok=True)
+    os.chmod(path, mode)  # Override umask
+    return path
+
+
+def _cache_key(prompt: str, cwd: str, model: str) -> str:
+    """Content-addressed key: hash of (git HEAD + dirty state + model + prompt).
+
+    Auto-invalidates when:
+    - The prompt changes (different task)
+    - Any commit is made (git HEAD changes)
+    - Any tracked file is modified without committing (dirty tree)
+    - A different model is requested (Flash vs Pro produce different results)
+    """
+    try:
+        head = _subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=cwd, text=True, stderr=_subprocess.DEVNULL
+        ).strip()
+    except (_subprocess.CalledProcessError, FileNotFoundError):
+        head = "no-git"
+    # Include dirty-tree signal so uncommitted edits bust the cache
+    try:
+        dirty = _subprocess.check_output(
+            ["git", "diff", "--stat"],
+            cwd=cwd, text=True, stderr=_subprocess.DEVNULL
+        ).strip()
+    except (_subprocess.CalledProcessError, FileNotFoundError):
+        dirty = ""
+    dirty_hash = hashlib.sha256(dirty.encode("utf-8")).hexdigest()[:8] if dirty else "clean"
+    composite = f"{head}\n{dirty_hash}\n{model}\n{prompt}"
+    return hashlib.sha256(composite.encode("utf-8")).hexdigest()[:32]
+
+
+def _cache_lookup(cache_dir: Path, key: str, cache_ttl: int) -> Optional[Dict[str, Any]]:
+    """Return cached result if it exists and is not expired.
+
+    Args:
+        cache_ttl: Max age in seconds. Passed as parameter to avoid global state.
+    """
+    cache_file = cache_dir / f"{key}.json"
+    if not cache_file.exists():
+        return None
+    # Wall-clock age check (timezone-immune)
+    file_age = time.time() - cache_file.stat().st_mtime
+    if file_age > cache_ttl:
+        cache_file.unlink(missing_ok=True)
+        return None
+    try:
+        data = json.loads(cache_file.read_text(encoding="utf-8"))
+        data["_cache_hit"] = True
+        return data
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _cache_store(cache_dir: Path, key: str, result: Dict[str, Any]) -> None:
+    """Store result in cache. Atomic write with 0600 permissions.
+
+    Non-fatal: logs to stderr and continues on failure (e.g., disk full).
+    """
+    try:
+        _ensure_dir(cache_dir)
+        cache_file = cache_dir / f"{key}.json"
+        # Strip internal fields before caching
+        to_cache = {k: v for k, v in result.items() if not k.startswith("_")}
+        fd = tempfile.mkstemp(dir=cache_dir, prefix=".tmp-cache-", suffix=".json")
+        temp_path = fd[1]
+        try:
+            with os.fdopen(fd[0], "w", encoding="utf-8") as f:
+                json.dump(to_cache, f, indent=2)
+            os.chmod(temp_path, 0o600)
+            os.replace(temp_path, cache_file)
+        except Exception:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+            raise
+    except Exception as e:
+        print(f"[bridge] Cache store failed (non-fatal): {e}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Token Estimation
+# ---------------------------------------------------------------------------
+# Rough heuristic: 1 token ~ 4 characters for English text.
+# This is an estimate, not a billing-accurate count.
+
+def _estimate_tokens(text: str) -> int:
+    """Rough token count estimate. Not billing-accurate."""
+    return max(1, len(text) // 4)
+
+
+# Pricing per 1M tokens (USD) -- update when prices change.
+# Source: https://ai.google.dev/pricing as of 2026-04.
+_MODEL_PRICING = {
+    "gemini-2.5-flash": {"input": 0.15, "output": 0.60},
+    "gemini-2.5-pro":   {"input": 1.25, "output": 10.00},
+    # Fallback for unknown models
+    "default":          {"input": 1.25, "output": 10.00},
+}
+
+
+def _estimate_cost(input_tokens: int, output_tokens: int, model: str) -> dict:
+    """Estimate USD cost based on token counts and model."""
+    pricing = _MODEL_PRICING.get(model, _MODEL_PRICING["default"])
+    input_cost = (input_tokens / 1_000_000) * pricing["input"]
+    output_cost = (output_tokens / 1_000_000) * pricing["output"]
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "model": model or "default",
+        "estimated_cost_usd": round(input_cost + output_cost, 6),
+        "note": "Estimate only. Actual billing may differ.",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Feedback Logging
+# ---------------------------------------------------------------------------
+
+
+def _sanitize_log_field(value: str) -> str:
+    """Strip newlines and carriage returns to prevent log injection."""
+    return value.replace("\n", " ").replace("\r", " ")
+
+
+def _write_feedback(cd: Path, feedback_str: str, model: str) -> None:
+    """Append a feedback entry to .gemini-bridge/feedback.log.
+
+    Format: VERDICT|TASK_TYPE|EST_TOKENS|NOTE
+    All fields are sanitized to prevent newline injection.
+    """
+    parts = feedback_str.split("|", 3)
+    if len(parts) != 4:
+        print(json.dumps({
+            "success": False,
+            "error": "Format: VERDICT|TASK_TYPE|EST_TOKENS|NOTE  "
+                     "(e.g., 'accepted|review|1.2k|clean review')"
+        }))
+        return
+
+    verdict, task_type, est_tokens, note = [_sanitize_log_field(p.strip()) for p in parts]
+    model = _sanitize_log_field(model)  # Sanitize caller-supplied model too
+    log_dir = _ensure_dir(cd.resolve() / ".gemini-bridge")
+    log_file = log_dir / "feedback.log"
+
+    timestamp = _datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    entry = f"{timestamp} | {model:<6} | {task_type:<12} | {verdict:<8} | {est_tokens:<6} | {note}\n"
+
+    # Open with restricted permissions
+    fd = os.open(log_file, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        os.write(fd, entry.encode("utf-8"))
+    finally:
+        os.close(fd)
+
+    print(json.dumps({"success": True, "logged": entry.strip()}))
+
+
+# ---------------------------------------------------------------------------
+# Parallel Execution (constant; full implementation added in Phase 3)
+# ---------------------------------------------------------------------------
+_MAX_PARALLEL_MODELS = 5
 
 
 def _get_sessions_dir(args: argparse.Namespace) -> Path:
@@ -377,6 +554,20 @@ async def _run_acp(args: argparse.Namespace, prompt_text: str) -> Dict[str, Any]
     cd: Path = args.cd.resolve()
     project_path = cd.as_posix()
 
+    # --- Cache check (before any ACP work) ---
+    cache_d: Optional[Path] = None
+    cache_key_str: Optional[str] = None
+    if getattr(args, "cache", False):
+        cache_ttl = getattr(args, "cache_ttl", DEFAULT_CACHE_TTL)
+        if cache_ttl < 1 or cache_ttl > 2592000:
+            cache_ttl = DEFAULT_CACHE_TTL
+        cache_d = _ensure_dir(DEFAULT_CACHE_DIR)
+        model_name = args.model or "default"
+        cache_key_str = _cache_key(prompt_text, project_path, model_name)
+        cached = _cache_lookup(cache_d, cache_key_str, cache_ttl)
+        if cached is not None:
+            return cached
+
     # Session resolution
     sessions_dir = _get_sessions_dir(args)
     session_path = _get_session_path(sessions_dir, project_path)
@@ -513,6 +704,11 @@ async def _run_acp(args: argparse.Namespace, prompt_text: str) -> Dict[str, Any]
         result["SESSION_ID"] = session_id
     result["agent_messages"] = client._agent_messages
     result["tool_calls"] = client._tool_calls
+    # Token estimation
+    model_name = args.model or "default"
+    input_tokens = _estimate_tokens(prompt_text)
+    output_tokens = _estimate_tokens(client._agent_messages)
+    result["token_estimate"] = _estimate_cost(input_tokens, output_tokens, model_name)
     if client._thoughts:
         result["thoughts"] = client._thoughts
     if client._plan:
@@ -522,7 +718,77 @@ async def _run_acp(args: argparse.Namespace, prompt_text: str) -> Dict[str, Any]
             _serialize_update(u) for u in client._all_messages
         ]
 
+    # --- Cache store (only on success, non-fatal on failure) ---
+    if cache_d and cache_key_str and result.get("success"):
+        _cache_store(cache_d, cache_key_str, result)
+
     return result
+
+
+# ---------------------------------------------------------------------------
+# Parallel Execution
+# ---------------------------------------------------------------------------
+async def _run_parallel(args: argparse.Namespace, prompt_text: str) -> Dict[str, Any]:
+    """Run N parallel ACP sessions, potentially with different models.
+
+    --parallel-models: comma-separated list of models.
+    Example: --parallel-models gemini-2.5-flash,gemini-2.5-pro
+    Each model gets its own ACP session with the same prompt.
+    Temp session directories are cleaned up in a finally block.
+    """
+    models = [m.strip() for m in args.parallel_models.split(",")]
+    if len(models) > _MAX_PARALLEL_MODELS:
+        return {
+            "success": False,
+            "error": f"Max {_MAX_PARALLEL_MODELS} parallel models allowed, got {len(models)}.",
+            "mode": "parallel",
+            "results": [],
+        }
+
+    temp_dirs: List[Path] = []
+    tasks: List[asyncio.Task] = []
+
+    try:
+        for i, model in enumerate(models):
+            model_args = copy.copy(args)
+            model_args.model = model
+            model_args.new_session = True  # Force fresh sessions for isolation
+            model_args.cache = False  # Disable cache in parallel to avoid racing writes
+            # Isolated session dir per model
+            model_dir = Path(tempfile.mkdtemp(prefix=f"gemini-parallel-{i}-"))
+            temp_dirs.append(model_dir)
+            model_args.sessions_dir = model_dir
+            # create_task() schedules immediately and returns a cancellable Task
+            tasks.append(asyncio.create_task(_run_acp(model_args, prompt_text)))
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Assemble parallel output
+        parallel_results = []
+        for model, res in zip(models, results):
+            if isinstance(res, BaseException):
+                parallel_results.append({
+                    "model": model,
+                    "success": False,
+                    "error": str(res),
+                })
+            elif isinstance(res, dict):
+                res["model_used"] = model
+                parallel_results.append(res)
+
+        return {
+            "success": all(r.get("success", False) for r in parallel_results),
+            "mode": "parallel",
+            "results": parallel_results,
+        }
+    finally:
+        # Cancel any tasks that were created but never gathered (mid-loop exception)
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        # Guaranteed cleanup of all temp session directories
+        for d in temp_dirs:
+            shutil.rmtree(d, ignore_errors=True)
 
 
 def _serialize_update(update: Any) -> Any:
@@ -585,7 +851,7 @@ def _emit(result: Dict[str, Any], args: argparse.Namespace) -> None:
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Gemini Bridge (ACP)")
 
-    prompt_group = parser.add_mutually_exclusive_group(required=True)
+    prompt_group = parser.add_mutually_exclusive_group(required=False)
     prompt_group.add_argument("--prompt", "--PROMPT", dest="prompt",
                               help="Prompt text to send to Gemini.")
     prompt_group.add_argument("--prompt-file", type=Path, dest="prompt_file",
@@ -599,8 +865,8 @@ def _parse_args() -> argparse.Namespace:
     session_group.add_argument("--new-session", action="store_true",
                                help="Force a fresh session.")
 
-    parser.add_argument("--cd", required=True, type=Path,
-                        help="Workspace root directory.")
+    parser.add_argument("--cd", type=Path, default=Path("."),
+                        help="Workspace root directory (default: current directory).")
     parser.add_argument("--sandbox", action="store_true", default=False,
                         help="Run Gemini in sandbox mode.")
     parser.add_argument("--model", default="",
@@ -623,6 +889,20 @@ def _parse_args() -> argparse.Namespace:
                         help="Include raw ACP events in output JSON.")
     parser.add_argument("--approve-edits", action="store_true",
                         help="Allow Gemini to write files within --cd scope.")
+    parser.add_argument("--cache", action="store_true", default=False,
+                        help="Enable result caching (skip Gemini if cache hit). "
+                             "Opt-in only. Omit for fresh results every time.")
+    parser.add_argument("--cache-ttl", type=int, default=86400,
+                        help="Cache time-to-live in seconds (default: 86400 = 24h). "
+                             "Must be between 1 and 2592000 (30 days).")
+    parser.add_argument("--clear-cache", action="store_true",
+                        help="Clear the result cache and exit.")
+    parser.add_argument("--parallel-models",
+                        help="Comma-separated models for parallel execution (e.g., 'gemini-2.5-flash,gemini-2.5-pro').")
+    parser.add_argument("--log-feedback",
+                        help="Append a feedback entry. Format: 'VERDICT|TASK_TYPE|EST_TOKENS|NOTE'. "
+                             "Example: 'accepted|review|1.2k|clean review'. "
+                             "Writes to .gemini-bridge/feedback.log in --cd directory.")
 
     return parser.parse_args()
 
@@ -633,6 +913,34 @@ def main() -> None:
         return
 
     args = _parse_args()
+
+    # --- Canonical argument validation (covers all early-exit flags) ---
+    has_prompt = bool(args.prompt or args.prompt_file or args.prompt_stdin)
+    has_early_exit = (
+        getattr(args, "clear_cache", False)
+        or getattr(args, "log_feedback", None)
+    )
+    if not has_prompt and not has_early_exit:
+        print(json.dumps({
+            "success": False,
+            "error": "A prompt source (--prompt, --prompt-file, or --prompt-stdin) "
+                     "is required unless using --clear-cache or --log-feedback.",
+        }))
+        return
+
+    if getattr(args, "clear_cache", False):
+        cache_path = DEFAULT_CACHE_DIR
+        if cache_path.exists():
+            count = len(list(cache_path.glob("*.json")))
+            shutil.rmtree(cache_path)
+            print(json.dumps({"success": True, "cleared": count, "path": str(cache_path)}))
+        else:
+            print(json.dumps({"success": True, "cleared": 0, "path": str(cache_path)}))
+        return
+
+    if args.log_feedback:
+        _write_feedback(args.cd, args.log_feedback, args.model or "unknown")
+        return
 
     if not args.cd.exists():
         print(json.dumps({"success": False, "error": f"Workspace `{args.cd.resolve()}` does not exist."}))
@@ -647,7 +955,10 @@ def main() -> None:
     else:
         prompt_text = args.prompt
 
-    result = asyncio.run(_run_acp(args, prompt_text))
+    if args.parallel_models:
+        result = asyncio.run(_run_parallel(args, prompt_text))
+    else:
+        result = asyncio.run(_run_acp(args, prompt_text))
     _emit(result, args)
 
 

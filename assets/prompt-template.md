@@ -6,12 +6,15 @@
 Task:
 - <what to analyze>
 
-Repo pointers:
-- <file paths + approximate line numbers>
+Files to read:
+- <file path>:<approximate line range>
+- <file path>:<approximate line range>
 
 Constraints:
-- Keep it concise and actionable.
-- Do not paste large snippets; reference files/lines instead.
+- Read the files yourself. I am not pasting content.
+- Keep it concise and actionable. Under 400 words.
+- Reference files/lines, do not paste large snippets.
+- DO NOT propose code changes unless explicitly asked.
 
 Output:
 - Bullet list of findings and a proposed plan.
@@ -42,10 +45,39 @@ Task:
 - Review the following unified diff for correctness, edge cases, and missing tests.
 
 Constraints:
-- Return a checklist of issues + suggested fixes (no code unless requested).
+- Analyze ONLY the changed lines and their immediate context.
+- DO NOT suggest style, naming, or formatting improvements.
+- DO NOT restate the code. Reference by file:line.
+- Keep response under 300 words.
 
 Input diff:
-<paste unified diff here>
+<paste `git diff` output -- hunks only, not full files>
+
+Output:
+- JSON: {"verdict": "ok"|"issues", "blocking": [{"file": "...", "line": N, "issue": "..."}], "minor": [...]}
+```
+
+## Focused diff review (cheapest review option)
+
+Use this when reviewing a specific git diff. Sends only the changed hunks, not full files.
+Claude should generate the diff via `git diff` and paste only the relevant hunks.
+
+```
+Task:
+- Review ONLY the diff below for bugs, edge cases, and correctness issues.
+
+Diff:
+<paste `git diff -- <file>` output>
+
+Constraints:
+- Analyze ONLY what changed. Do not review surrounding unchanged code.
+- DO NOT suggest style, naming, or refactoring improvements.
+- DO NOT restate the diff. Reference changes by +/- line markers.
+- If the diff is correct, respond with: {"verdict": "ok", "blocking": [], "minor": []}
+
+Output:
+- JSON only. No prose. No explanation unless a blocking issue exists.
+- Schema: {"verdict": "ok"|"issues", "blocking": [{"hunk": "+/- line ref", "issue": "..."}], "minor": [...]}
 ```
 
 ## Tool-assisted review (ACP — Gemini reads files directly)
@@ -54,14 +86,19 @@ Input diff:
 Task:
 - Review the implementation of <feature/function> for correctness and edge cases.
 
-Repo pointers:
-- Start at <file path>:<line range>
-- Also check <related file>:<line range> for integration points
+Files to read (use your file reading capability):
+- <file path>:<start_line>-<end_line>  (primary focus)
+- <related file>:<start_line>-<end_line>  (integration point, if any)
+
+Context:
+- <1-2 sentence description of what this code does and what changed>
 
 Constraints:
 - Read the files yourself using the workspace. Do not ask for code to be pasted.
 - Check: off-by-one errors, null/empty handling, error paths, thread safety.
 - Cross-reference any claims in comments/docs against the actual code.
+- DO NOT suggest unrelated refactors or style improvements.
+- DO NOT restate code back. Reference by file:line.
 
 Output:
 - JSON: {"verdict": "ok"|"issues", "blocking": [...], "minor": [...]}
@@ -131,12 +168,14 @@ Task:
   Find ways it could fail, miss edge cases, or produce incorrect results.
 
 Plan:
-<paste plan text here>
+<paste plan text -- this is the ONE case where pasting is acceptable, since plans are not files>
 
 Constraints:
-- Check all technical claims against the actual source files.
+- Check all technical claims against actual source files (read them yourself).
 - Find at least 3 potential failure modes.
-- For each issue: state the mechanism, the evidence, and severity (blocking/non-blocking).
+- For each issue: state mechanism, evidence, and severity.
+- DO NOT suggest improvements beyond the scope of the plan.
+- Keep total response under 500 words.
 
 Output:
 - JSON: {"verdict": "PASS"|"FAIL", "blocking_issues": [{"issue": "...", "evidence": "...", "severity": "blocking"}], "non_blocking": [...]}
