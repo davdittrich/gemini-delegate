@@ -37,13 +37,16 @@ python3 ~/.agents/skills/gemini-delegate/scripts/gemini_bridge.py \
   --cd "." --prompt "Review src/auth.py around login() and propose fixes."
 ```
 
-For prompts with heavy special characters, use `--prompt-file`:
+### Automation & Concurrency
+For automated callers or concurrent agents, use `--prompt-stdin` to avoid temporary file collisions:
+
 ```bash
-python3 ~/.agents/skills/gemini-delegate/scripts/gemini_bridge.py \
-  --cd "." --prompt-file /tmp/review_prompt.txt
+echo "Review the architecture of src/" | \
+  python3 ~/.agents/skills/gemini-delegate/scripts/gemini_bridge.py \
+  --cd "." --prompt-stdin --output-file AUTO
 ```
 
-**Output:** JSON with `success`, `SESSION_ID`, `agent_messages`, `tool_calls`, `stop_reason`, and optional `error` / `thoughts` / `plan`.
+**Note**: `--output-file AUTO` generates a unique, private (`0600`) JSON file in `/tmp`.
 
 ## Multi-turn sessions
 
@@ -57,22 +60,35 @@ python3 ~/.agents/skills/gemini-delegate/scripts/gemini_bridge.py \
   --cd "." --session-id "<SESSION_ID>" --prompt "Now propose a minimal fix as Unified Diff Patch ONLY."
 ```
 
-Sessions are auto-persisted per project directory. Expired sessions automatically fall back to a fresh session.
+Sessions are auto-persisted per project directory using hashed identifiers in `~/.cache/gemini-bridge/sessions/`.
+
+## Concurrency & Isolation
+
+When running multiple independent agents in the same project, isolate their session states using `GEMINI_BRIDGE_SESSIONS_DIR`:
+
+```bash
+export GEMINI_BRIDGE_SESSIONS_DIR="/tmp/agent-alpha-cache"
+python3 ~/.agents/skills/gemini-delegate/scripts/gemini_bridge.py --cd "." --prompt "..."
+```
+
+Alternatively, use the `--sessions-dir` flag. Precedence: **Flag > Environment Variable > Default Path**.
 
 ## CLI flags
 
 | Flag | Description |
 |---|---|
-| `--prompt` / `--PROMPT` | Prompt text (both accepted) |
-| `--prompt-file` | Read prompt from file (mutually exclusive with `--prompt`) |
-| `--session-id` / `--SESSION_ID` | Resume a specific session |
-| `--new-session` | Force fresh session (mutually exclusive with `--session-id`) |
+| `--prompt` | Prompt text |
+| `--prompt-file` | Read prompt from file |
+| `--prompt-stdin` | Read prompt from stdin (Preferred for automation) |
+| `--session-id` | Resume a specific session |
+| `--new-session` | Force fresh session |
+| `--sessions-dir` | Override session storage directory |
 | `--cd` | Workspace root directory (required) |
 | `--sandbox` | Run Gemini in sandbox mode |
 | `--model` | Override the Gemini model |
 | `--timeout` | Max seconds (default: 300) |
 | `--parse-json` | Extract JSON from `agent_messages` |
-| `--output-file` | Write result JSON to file |
+| `--output-file` | Write result JSON to file (or `AUTO` for unique temp file) |
 | `--return-all-messages` | Include raw ACP events in output |
 | `--approve-edits` | Allow Gemini to write files within `--cd` scope |
 
@@ -88,76 +104,26 @@ Sessions are auto-persisted per project directory. Expired sessions automaticall
   "stop_reason": "end_turn",
   "plan": [{"content": "Read the file", "status": "completed"}],
   "error": null,
-  "parsed_json": {}
+  "parsed_json": {},
+  "AUTO_OUTPUT_FILE": "/tmp/gemini_bridge_res_xyz.json"
 }
 ```
-
-### Key fields
-
-- **`tool_calls`**: What Gemini read/wrote. Update the Collaboration State Capsule with paths. Flag `write_file` type for human review.
-- **`stop_reason`**: `end_turn` (normal), `max_tokens`/`max_turn_requests` (continue session), `refusal` (rephrase), `timeout`/`crash`/`error` (bridge-synthesized failures).
-- **`thoughts`**: Gemini's reasoning — include in the Capsule's "Gemini summary" if present.
-- **`all_messages`**: Raw ACP `SessionNotification` objects (when `--return-all-messages` is set).
 
 ## Permission control
 
 By default, Gemini can **read** files within `--cd` scope but **cannot write**. The `--approve-edits` flag enables scoped writes.
 
-**When to pass `--approve-edits`:**
-- **NEVER** for review, analysis, or audit tasks
-- **NEVER** by default
-- **ONLY** when the human user has explicitly requested Gemini to make file changes
-
 **Path containment**: All file operations are restricted to the `--cd` workspace root. Paths outside scope are rejected. Terminal execution is always blocked.
-
-## Prompting patterns
-
-Use `assets/prompt-template.md` as a starter.
-
-### 1) Ask Gemini to open files itself
-Provide entry file(s) and approximate line numbers, objective and constraints, output format (diff vs analysis). Avoid pasting large code blocks.
-
-### 2) Enforce safe output for code changes
-Append to prompts: `OUTPUT: Unified Diff Patch ONLY. Strictly prohibit any actual modifications.`
-
-### 3) Use Gemini for what it's good at
-- Alternative solution paths and edge cases
-- UI/UX and readability feedback
-- Review of a proposed patch (risk spotting, missing tests)
-- Search the web (Gemini has built-in Google Search)
 
 ## Proactive collaboration triggers
 
-Gemini adds the most value as a pre-action safety net — catching gaps before expensive operations run. A 30-second Gemini check prevents 30-minute re-runs.
+Gemini adds the most value as a pre-action safety net — catching gaps before expensive operations run.
 
 ### Before running expensive benchmarks
 
 ```bash
 python3 ~/.agents/skills/gemini-delegate/scripts/gemini_bridge.py \
-  --cd "." --prompt "Read benchmarks/run_benchmarks.R and the benchmark script at /tmp/regression_head2head.R. List every estimator group present in run_benchmarks.R. Then check which groups are MISSING from the regression script. Also: does the script have any early quit()/stop() calls? OUTPUT: bullet list of missing groups and structural issues."
-```
-
-### Before proposing a code fix
-
-```bash
-python3 ~/.agents/skills/gemini-delegate/scripts/gemini_bridge.py \
-  --cd "." --prompt "Read src/robust_core.h lines 76-145. I propose to [describe change]. The original bug was: [describe previous bug]. Question: does the proposed fix re-introduce that bug? OUTPUT: yes/no verdict with evidence from the source."
-```
-
-### Before modifying an existing script
-
-```bash
-python3 ~/.agents/skills/gemini-delegate/scripts/gemini_bridge.py \
-  --cd "." --prompt "Read [script path]. Map the control flow: where are quit()/stop() calls? What functions are defined and where are they scoped? If I append code at the end, will it execute? OUTPUT: control flow summary with line numbers."
-```
-
-### As a cross-model adversarial reviewer
-
-In the metaswarm plan-review-gate, one reviewer can be Gemini instead of a Claude subagent. Use the "Plan review (adversarial)" template from `assets/prompt-template.md` and pass `--parse-json`:
-
-```bash
-python3 ~/.agents/skills/gemini-delegate/scripts/gemini_bridge.py \
-  --cd "." --prompt-file /tmp/review_brief.txt --parse-json --timeout 120
+  --cd "." --prompt "Read benchmarks/run_benchmarks.R and list every estimator group present. Then check which groups are MISSING from the regression script at /tmp/regression_head2head.R."
 ```
 
 ### Web search delegation
@@ -168,22 +134,6 @@ Gemini has built-in Google Search. Delegate current-information queries:
 python3 ~/.agents/skills/gemini-delegate/scripts/gemini_bridge.py \
   --cd "." --prompt "Search the web for the latest version of package X. Cite sources with URLs. OUTPUT: bullet list."
 ```
-
-### Background Gemini queries
-
-For expensive queries, run in the background via Claude's Agent tool:
-
-```python
-Agent(
-  description="Gemini codebase review",
-  prompt="Run: python3 ~/.agents/skills/gemini-delegate/scripts/gemini_bridge.py "
-         "--cd /path/to/repo --prompt 'Analyze architecture of src/'",
-  run_in_background=True,
-  model="haiku"
-)
-```
-
-Model routing: use Tier 1 (haiku) for launching bridge invocations — the model selection happens inside Gemini, not in the calling Claude agent.
 
 ## Collaboration State Capsule
 Keep this short block updated near the end of your reply while collaborating:

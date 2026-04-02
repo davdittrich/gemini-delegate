@@ -8,6 +8,7 @@ Replaces the previous stream-json transport with structured, typed communication
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -35,32 +36,92 @@ from acp.schema import (
 )
 
 # ---------------------------------------------------------------------------
-# Session persistence
+# Session persistence (Shredded/Hashed approach)
 # ---------------------------------------------------------------------------
-SESSIONS_DIR = Path.home() / ".cache" / "gemini-bridge"
-SESSIONS_FILE = SESSIONS_DIR / "sessions.json"
+DEFAULT_SESSIONS_DIR = Path(os.getenv("XDG_CACHE_HOME", Path.home() / ".cache")) / "gemini-bridge" / "sessions"
 
 
-def _load_sessions() -> Dict[str, str]:
-    if not SESSIONS_FILE.exists():
-        return {}
+def _get_sessions_dir(args: argparse.Namespace) -> Path:
+    """Resolve sessions directory with precedence: Flag > Env > Default."""
+    env_dir = os.getenv("GEMINI_BRIDGE_SESSIONS_DIR")
+    if args.sessions_dir:
+        path = Path(args.sessions_dir)
+    elif env_dir:
+        path = Path(env_dir)
+    else:
+        path = DEFAULT_SESSIONS_DIR
+
+    if not path.exists():
+        path.mkdir(parents=True, exist_ok=True)
+        os.chmod(path, 0o700)
+    return path
+
+
+def _get_session_path(sessions_dir: Path, project_path: str) -> Path:
+    """Generate a debuggable hashed filename for a project."""
+    resolved_path = Path(project_path).resolve().as_posix()
+    path_hash = hashlib.sha256(resolved_path.encode("utf-8")).hexdigest()[:16]
+    basename = Path(project_path).name or "root"
+    # Ensure basename is safe for filenames
+    safe_basename = re.sub(r"[^a-zA-Z0-0_\-]", "_", basename)
+    return sessions_dir / f"{safe_basename}_{path_hash}.json"
+
+
+def _load_session(session_path: Path, project_path: str) -> Optional[str]:
+    """Load session ID from a hashed project file, with legacy fallback."""
+    # 1. Check for shredded session file
+    if session_path.exists():
+        try:
+            data = json.loads(session_path.read_text(encoding="utf-8"))
+            return data.get("session_id")
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # 2. Legacy fallback (copy-on-demand)
+    legacy_file = session_path.parent.parent / "sessions.json"
+    if legacy_file.exists():
+        try:
+            legacy_data = json.loads(legacy_file.read_text(encoding="utf-8"))
+            resolved_project = Path(project_path).resolve().as_posix()
+            if resolved_project in legacy_data:
+                session_id = legacy_data[resolved_project]
+                # Migration: save to the new shredded format
+                _save_session(session_path, project_path, session_id)
+                return session_id
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    return None
+
+
+def _save_session(session_path: Path, project_path: str, session_id: str) -> None:
+    """Atomic save of session ID to a hashed project file."""
+    session_path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(session_path.parent, 0o700)
+
+    data = {
+        "project_path": Path(project_path).resolve().as_posix(),
+        "session_id": session_id,
+    }
+
+    # Atomic write via tempfile
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        dir=session_path.parent,
+        delete=False,
+        encoding="utf-8",
+        prefix=".tmp-sess-"
+    ) as tf:
+        json.dump(data, tf, indent=2)
+        temp_name = tf.name
+
     try:
-        return json.loads(SESSIONS_FILE.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return {}
-
-
-def _save_session(project_path: str, session_id: str) -> None:
-    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-    os.chmod(SESSIONS_DIR, 0o700)
-    sessions = _load_sessions()
-    sessions[project_path] = session_id
-    SESSIONS_FILE.write_text(json.dumps(sessions, indent=2), encoding="utf-8")
-    os.chmod(SESSIONS_FILE, 0o600)
-
-
-def _get_persisted_session(project_path: str) -> Optional[str]:
-    return _load_sessions().get(project_path)
+        os.chmod(temp_name, 0o600)
+        os.replace(temp_name, session_path)
+    except Exception:
+        if os.path.exists(temp_name):
+            os.unlink(temp_name)
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -245,21 +306,28 @@ async def _run_acp(args: argparse.Namespace) -> Dict[str, Any]:
 
     # Determine prompt
     prompt_text: Optional[str] = None
-    if args.prompt_file is not None:
+    if args.prompt_stdin:
+        # Read from stdin BEFORE spawning process to avoid deadlocks
+        prompt_text = sys.stdin.read()
+    elif args.prompt_file is not None:
         if not args.prompt_file.exists():
             return {"success": False, "error": f"Prompt file `{args.prompt_file}` does not exist."}
         prompt_text = args.prompt_file.read_text(encoding="utf-8")
     elif args.prompt:
         prompt_text = args.prompt
+    
     if not prompt_text:
         return {"success": False, "error": "No prompt provided."}
 
     # Session resolution
+    sessions_dir = _get_sessions_dir(args)
+    session_path = _get_session_path(sessions_dir, project_path)
+
     resume_id = ""
     if args.session_id:
         resume_id = args.session_id
     elif not args.new_session:
-        persisted = _get_persisted_session(project_path)
+        persisted = _load_session(session_path, project_path)
         if persisted:
             resume_id = persisted
 
@@ -297,11 +365,11 @@ async def _run_acp(args: argparse.Namespace) -> Dict[str, Any]:
                 except RequestError:
                     session = await conn.new_session(cwd=cd.as_posix(), mcp_servers=[])
                     session_id = session.session_id
-                    _save_session(project_path, session_id)
+                    _save_session(session_path, project_path, session_id)
             else:
                 session = await conn.new_session(cwd=cd.as_posix(), mcp_servers=[])
                 session_id = session.session_id
-                _save_session(project_path, session_id)
+                _save_session(session_path, project_path, session_id)
 
             # Prompt with timeout
             timeout = args.timeout
@@ -378,18 +446,40 @@ def _emit(result: Dict[str, Any], args: argparse.Namespace) -> None:
 
     output = json.dumps(result, indent=2, ensure_ascii=False)
     print(output)
-    if hasattr(args, "output_file") and args.output_file:
-        # Validate output-file path
-        resolved = Path(args.output_file).resolve()
-        cwd_root = Path(args.cd).resolve()
-        tmp_root = Path(tempfile.gettempdir()).resolve()
-        if not (resolved.is_relative_to(cwd_root) or resolved.is_relative_to(tmp_root)):
-            print(json.dumps({
-                "success": False,
-                "error": "--output-file must be within the workspace or system temp directory",
-            }), file=sys.stderr)
-            return
-        resolved.write_text(output, encoding="utf-8")
+    
+    output_file = getattr(args, "output_file", None)
+    if output_file:
+        is_auto = str(output_file).upper() == "AUTO"
+        
+        if is_auto:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                suffix=".json",
+                delete=False,
+                encoding="utf-8",
+                prefix="gemini_bridge_res_"
+            ) as f:
+                f.write(output)
+                resolved = Path(f.name).resolve()
+            
+            # Update result with the auto path for the user to see in the JSON
+            # Note: The 'print(output)' above already fired, so this is for the file itself
+            # and potentially for stderr communication.
+            print(f"[bridge] Result saved to {resolved} (0600 permissions). Manual cleanup recommended.", file=sys.stderr)
+            result["AUTO_OUTPUT_FILE"] = str(resolved)
+        else:
+            # Validate output-file path
+            resolved = Path(output_file).resolve()
+            cwd_root = Path(args.cd).resolve()
+            tmp_root = Path(tempfile.gettempdir()).resolve()
+            
+            if not (resolved.is_relative_to(cwd_root) or resolved.is_relative_to(tmp_root)):
+                print(json.dumps({
+                    "success": False,
+                    "error": "--output-file must be within the workspace or system temp directory",
+                }), file=sys.stderr)
+                return
+            resolved.write_text(output, encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -403,6 +493,8 @@ def _parse_args() -> argparse.Namespace:
                               help="Prompt text to send to Gemini.")
     prompt_group.add_argument("--prompt-file", type=Path, dest="prompt_file",
                               help="Read prompt from a file.")
+    prompt_group.add_argument("--prompt-stdin", action="store_true",
+                              help="Read prompt from stdin.")
 
     session_group = parser.add_mutually_exclusive_group()
     session_group.add_argument("--session-id", "--SESSION_ID", dest="session_id", default="",
@@ -420,8 +512,10 @@ def _parse_args() -> argparse.Namespace:
                         help="Max wall-clock seconds (default: 300).")
     parser.add_argument("--parse-json", action="store_true",
                         help="Extract JSON from agent_messages.")
-    parser.add_argument("--output-file", type=Path,
-                        help="Write result JSON to this file.")
+    parser.add_argument("--output-file",
+                        help="Write result JSON to this file (or 'AUTO' for unique temp file).")
+    parser.add_argument("--sessions-dir", type=Path,
+                        help="Override default session storage directory.")
     parser.add_argument("--return-all-messages", action="store_true",
                         help="Include raw ACP events in output JSON.")
     parser.add_argument("--approve-edits", action="store_true",
