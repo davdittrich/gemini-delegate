@@ -1,0 +1,17 @@
+{
+  "name": "gemini-delegate",
+  "owner": {
+    "name": "davdittrich"
+  },
+  "plugins": [
+    {
+      "name": "gemini-delegate",
+      "source": "./",
+      "description": "Delegate coding tasks to Gemini CLI via ACP (Agent Client Protocol). Structured JSON output, permission-controlled file access, multi-turn sessions.",
+      "version": "1.0.0",
+      "license": "Apache-2.0",
+      "keywords": ["gemini", "acp", "claude-code", "agent-client-protocol", "delegation"],
+      "category": "development"
+    }
+  ]
+}
