@@ -15,17 +15,15 @@ Install the ACP SDK (one-time):
 ```bash
 pip install --user -r ~/.agents/skills/gemini-delegate/requirements.txt
 ```
-On systems with a writable site-packages (venv, conda), plain `pip install -r` works.
 
 Requires Gemini CLI >= 0.36.0 with `--acp` support.
 
 ## Core rules
 - Gemini is a collaborator; you own the final result.
 - Always use the bridge script (`scripts/gemini_bridge.py`).
-- Prefer file/line references over pasting snippets. Set `--cd` to the repo root.
-- For code changes, request **Unified Diff Patch ONLY** and forbid direct file modification (unless `--approve-edits` is set).
+- **Use `--prompt-stdin`** for all automated calls to prevent deadlock and temp-file collisions.
+- **Use `--output-file AUTO`** when result persistence is needed (produces unique `0600` file).
 - Capture `SESSION_ID` from output and reuse it for follow-ups.
-- Keep a short **Collaboration State Capsule** updated while this skill is active.
 - Default timeout: set Bash tool `timeout_ms` to **600000 (10 minutes)**.
 
 ## Quick start
@@ -33,45 +31,28 @@ Requires Gemini CLI >= 0.36.0 with `--acp` support.
 Shell quoting is no longer a concern. Prompts are transmitted via JSON-RPC, never as shell arguments.
 
 ```bash
-python3 ~/.agents/skills/gemini-delegate/scripts/gemini_bridge.py \
-  --cd "." --prompt "Review src/auth.py around login() and propose fixes."
-```
-
-### Automation & Concurrency
-For automated callers or concurrent agents, use `--prompt-stdin` to avoid temporary file collisions:
-
-```bash
-echo "Review the architecture of src/" | \
+echo "Review src/auth.py around login() and propose fixes." | \
   python3 ~/.agents/skills/gemini-delegate/scripts/gemini_bridge.py \
   --cd "." --prompt-stdin --output-file AUTO
 ```
 
-**Note**: `--output-file AUTO` generates a unique, private (`0600`) JSON file in `/tmp`.
-
-## Progress-Aware Timeouts (Heartbeat)
-
-The bridge uses a **Heartbeat Watchdog** to handle long-running reasoning tasks:
-
-- **Connect Timeout (60s)**: Handshake and session loading.
-- **Initial Idle (300s)**: Time allowed for Gemini to start its first response chunk.
-- **Subsequent Idle (120s)**: Max time allowed between response chunks.
-- **Total Timeout (600s)**: Absolute hard cap for the entire operation.
-
-Adjust these via `--first-chunk-timeout`, `--idle-timeout`, and `--timeout`.
+**Output:** JSON with `success`, `SESSION_ID`, `agent_messages`, `tool_calls`, `stop_reason`, and `AUTO_OUTPUT_FILE`.
 
 ## Multi-turn sessions
 
 ```bash
 # Start a session
-python3 ~/.agents/skills/gemini-delegate/scripts/gemini_bridge.py \
-  --cd "." --prompt "Analyze the bug in foo(). Keep it short."
+echo "Analyze the bug in foo(). Keep it short." | \
+  python3 ~/.agents/skills/gemini-delegate/scripts/gemini_bridge.py \
+  --cd "." --prompt-stdin
 
 # Continue the same session (use SESSION_ID from previous output)
-python3 ~/.agents/skills/gemini-delegate/scripts/gemini_bridge.py \
-  --cd "." --session-id "<SESSION_ID>" --prompt "Now propose a minimal fix as Unified Diff Patch ONLY."
+echo "Now propose a minimal fix." | \
+  python3 ~/.agents/skills/gemini-delegate/scripts/gemini_bridge.py \
+  --cd "." --session-id "<SESSION_ID>" --prompt-stdin
 ```
 
-Sessions are auto-persisted per project directory using hashed identifiers in `~/.cache/gemini-bridge/sessions/`.
+Sessions are auto-persisted per project using hashed identifiers in `~/.cache/gemini-bridge/sessions/`.
 
 ## Concurrency & Isolation
 
@@ -79,32 +60,39 @@ When running multiple independent agents in the same project, isolate their sess
 
 ```bash
 export GEMINI_BRIDGE_SESSIONS_DIR="/tmp/agent-alpha-cache"
-python3 ~/.agents/skills/gemini-delegate/scripts/gemini_bridge.py --cd "." --prompt "..."
+python3 gemini_bridge.py --cd "." --prompt "..."
 ```
 
-Alternatively, use the `--sessions-dir` flag. Precedence: **Flag > Environment Variable > Default Path**.
+Precedence: **Flag > Environment Variable > Default Path**.
+
+## Progress-Aware Timeouts (Heartbeat)
+
+The bridge monitors Gemini's activity to handle reasoning model latency:
+
+- **Connect (60s)**: Handshake and session loading.
+- **Initial Idle (300s)**: Time allowed for Gemini to start its first response chunk.
+- **Subsequent Idle (120s)**: Max time allowed between response chunks.
+- **Total (600s)**: Absolute hard cap.
+
+For massive codebases or complex web searches, increase `--first-chunk-timeout` and `--timeout`.
 
 ## CLI flags
 
-| Flag | Description |
-|---|---|
-| `--prompt` | Prompt text |
-| `--prompt-file` | Read prompt from file |
-| `--prompt-stdin` | Read prompt from stdin (Preferred for automation) |
-| `--session-id` | Resume a specific session |
-| `--new-session` | Force fresh session |
-| `--sessions-dir` | Override session storage directory |
-| `--cd` | Workspace root directory (required) |
-| `--sandbox` | Run Gemini in sandbox mode |
-| `--model` | Override the Gemini model |
-| `--timeout` | Total max wall-clock seconds (default: 600) |
-| `--idle-timeout` | Max seconds between chunks (default: 120) |
-| `--first-chunk-timeout` | Max seconds for first chunk (default: 300) |
-| `--verbose` | Print heartbeat markers to stderr |
-| `--parse-json` | Extract JSON from `agent_messages` |
-| `--output-file` | Write result JSON to file (or `AUTO` for unique temp file) |
-| `--return-all-messages` | Include raw ACP events in output |
-| `--approve-edits` | Allow Gemini to write files within `--cd` scope |
+| Flag | Description | Default |
+|---|---|---|
+| `--prompt` | Prompt text | |
+| `--prompt-file` | Read prompt from file | |
+| `--prompt-stdin` | Read prompt from stdin (Mandatory for automation) | |
+| `--session-id` | Resume a specific session | |
+| `--new-session` | Force fresh session | |
+| `--sessions-dir` | Override session storage directory | |
+| `--cd` | Workspace root directory (required) | |
+| `--timeout` | Total max wall-clock seconds | 600 |
+| `--idle-timeout` | Max seconds between chunks | 120 |
+| `--first-chunk-timeout` | Max seconds for first chunk | 300 |
+| `--verbose` | Print heartbeat markers to stderr | |
+| `--output-file` | Write JSON to file (or `AUTO` for unique temp) | |
+| `--approve-edits` | Allow Gemini to write files within `--cd` scope | |
 
 ## Output format
 
@@ -116,38 +104,14 @@ Alternatively, use the `--sessions-dir` flag. Precedence: **Flag > Environment V
   "tool_calls": [{"id": "tc-001", "title": "Read file", "type": "read_file", "status": "completed", "path": "src/auth.py"}],
   "thoughts": "Agent reasoning (if emitted)",
   "stop_reason": "end_turn",
-  "plan": [{"content": "Read the file", "status": "completed"}],
-  "error": null,
-  "parsed_json": {},
-  "AUTO_OUTPUT_FILE": "/tmp/gemini_bridge_res_xyz.json"
+  "AUTO_OUTPUT_FILE": "/tmp/gemini_bridge_res_xyz.json",
+  "error": null
 }
 ```
 
 ## Permission control
 
-By default, Gemini can **read** files within `--cd` scope but **cannot write**. The `--approve-edits` flag enables scoped writes.
-
-**Path containment**: All file operations are restricted to the `--cd` workspace root. Paths outside scope are rejected. Terminal execution is always blocked.
-
-## Proactive collaboration triggers
-
-Gemini adds the most value as a pre-action safety net — catching gaps before expensive operations run.
-
-### Before running expensive benchmarks
-
-```bash
-python3 ~/.agents/skills/gemini-delegate/scripts/gemini_bridge.py \
-  --cd "." --prompt "Read benchmarks/run_benchmarks.R and list every estimator group present. Then check which groups are MISSING from the regression script at /tmp/regression_head2head.R."
-```
-
-### Web search delegation
-
-Gemini has built-in Google Search. Delegate current-information queries:
-
-```bash
-python3 ~/.agents/skills/gemini-delegate/scripts/gemini_bridge.py \
-  --cd "." --prompt "Search the web for the latest version of package X. Cite sources with URLs. OUTPUT: bullet list."
-```
+By default, Gemini can **read** files within `--cd` scope but **cannot write**. The `--approve-edits` flag enables scoped writes. Terminal execution is always blocked.
 
 ## Collaboration State Capsule
 Keep this short block updated near the end of your reply while collaborating:
