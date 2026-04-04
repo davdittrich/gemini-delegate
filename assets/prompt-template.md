@@ -165,7 +165,7 @@ Output:
 ```
 Task:
 - Review the following implementation plan as an adversarial reviewer.
-  Find ways it could fail, miss edge cases, or produce incorrect results.
+  Find all ways it could fail, miss edge cases, or produce incorrect results.
 
 Plan:
 <paste plan text -- this is the ONE case where pasting is acceptable, since plans are not files>
@@ -175,7 +175,7 @@ Constraints:
 - Find at least 3 potential failure modes.
 - For each issue: state mechanism, evidence, and severity.
 - DO NOT suggest improvements beyond the scope of the plan.
-- Keep total response under 500 words.
+- Keep response brief.
 
 Output:
 - JSON: {"verdict": "PASS"|"FAIL", "blocking_issues": [{"issue": "...", "evidence": "...", "severity": "blocking"}], "non_blocking": [...]}

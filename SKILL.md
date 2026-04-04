@@ -61,19 +61,31 @@ Before EVERY delegation:
 
 ## When to delegate
 
-ALL must hold: task reads >200 lines Claude hasn't seen, task is self-contained, output is verifiable.
+ALL must hold: task reads >200 lines Claude hasn't seen, task is
+self-contained, output is verifiable.
 
-**High-value**: web searches, large file analysis, parallel reviews, adversarial second opinions, tedious enumeration, **plan review gate participation** (see below).
+**High-value**: web searches, large file analysis, parallel reviews,
+adversarial second opinions, tedious enumeration, **plan review gate
+participation** (see below).
 
-**Proactive use in plan review gates**: When `/plan-review-gate` runs, include a Gemini reviewer as a fourth adversarial reviewer alongside the 3 standard Claude reviewers — from Round 1, not as a later addition. Use `gemini-3.1-pro-preview` with the "Adversarial plan critique" template. Different model families have different attention patterns: in the scholarposter project, Gemini Pro caught a missed exception site and an early-return behavioral difference that all three Claude reviewers missed.
+**Proactive use in plan review gates**: When `/plan-review-gate` runs,
+include a Gemini reviewer as an additional adversarial reviewer alongside the
+standard reviewers — from Round 1, not as a later addition. Use
+`gemini-3.1-pro-preview` with the "Adversarial plan critique" template.
 
 ## When NOT to delegate
 
-ANY disqualifies: <30s of Claude reasoning, needs conversation context, file <50 lines, need to edit immediately after, security-sensitive, already done this session.
+ANY disqualifies: <30s of Claude reasoning, needs conversation context,
+file <50 lines, need to edit immediately after, security-sensitive,
+already done this session.
 
 ## Feedback log
 
-After verifying output, log the outcome via `--log-feedback "VERDICT|TASK_TYPE|EST_TOKENS|NOTE"`. Before delegating, scan last 10 entries for this task type — if rejection rate >50%, escalate model tier. Log immediately after verification; do not batch or skip. See `assets/reference.md` for format details.
+After verifying output, log the outcome via `--log-feedback
+"VERDICT|TASK_TYPE|EST_TOKENS|NOTE"`. Before delegating, scan last 10
+entries for this task type — if rejection rate >50%, escalate model
+tier. Log immediately after verification; do not batch or skip. See
+`assets/reference.md` for format details.
 
 ## CLI flags
 
