@@ -63,7 +63,9 @@ Before EVERY delegation:
 
 ALL must hold: task reads >200 lines Claude hasn't seen, task is self-contained, output is verifiable.
 
-**High-value**: web searches, large file analysis, parallel reviews, adversarial second opinions, tedious enumeration.
+**High-value**: web searches, large file analysis, parallel reviews, adversarial second opinions, tedious enumeration, **plan review gate participation** (see below).
+
+**Proactive use in plan review gates**: When `/plan-review-gate` runs, include a Gemini reviewer as a fourth adversarial reviewer alongside the 3 standard Claude reviewers — from Round 1, not as a later addition. Use `gemini-3.1-pro-preview` with the "Adversarial plan critique" template. Different model families have different attention patterns: in the scholarposter project, Gemini Pro caught a missed exception site and an early-return behavioral difference that all three Claude reviewers missed.
 
 ## When NOT to delegate
 
