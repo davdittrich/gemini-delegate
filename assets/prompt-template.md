@@ -149,7 +149,7 @@ Output:
 
 ```
 Task:
-- <research question requiring up-to-date information>
+- Use *google_web_search*: <research question requiring up-to-date information>
 
 Constraints:
 - Search the web for current information.
