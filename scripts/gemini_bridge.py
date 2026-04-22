@@ -13,6 +13,7 @@ import datetime as _datetime
 import enum
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -111,6 +112,81 @@ class HeartbeatWatchdog:
 # Session persistence (Shredded/Hashed approach)
 # ---------------------------------------------------------------------------
 DEFAULT_SESSIONS_DIR = Path(os.getenv("XDG_CACHE_HOME", Path.home() / ".cache")) / "gemini-bridge" / "sessions"
+
+
+# ---------------------------------------------------------------------------
+# Model Registry & Dynamic Pricing
+# ---------------------------------------------------------------------------
+DEFAULT_REGISTRY_CACHE_DIR = Path(os.getenv("XDG_CACHE_HOME", Path.home() / ".cache")) / "gemini-bridge"
+DEFAULT_SYSTEM_REGISTRY = Path.home() / ".agents/skills/model-routing/model-registry.json"
+
+class ModelRegistry:
+    """Manages available models and their pricing with daily caching."""
+
+    def __init__(self, cache_dir: Path = DEFAULT_REGISTRY_CACHE_DIR, source_file: Path = DEFAULT_SYSTEM_REGISTRY):
+        self.cache_dir = cache_dir
+        self.cache_file = cache_dir / "models.json"
+        self.source_file = source_file
+        self.ttl = 86400  # 24 hours
+        self._data = {}
+
+    def get_models(self) -> Dict[str, Any]:
+        """Return dict of model_id -> metadata (including pricing)."""
+        if not self._data:
+            self._load()
+        return self._data
+
+    def get_pricing(self, model_id: str) -> Dict[str, float]:
+        """Return pricing for a model, fallback to default if unknown."""
+        models = self.get_models()
+        if model_id in models:
+            return models[model_id].get("pricing", _MODEL_PRICING["default"])
+        return _MODEL_PRICING.get(model_id, _MODEL_PRICING["default"])
+
+    def _load(self):
+        if self.cache_file.exists():
+            age = time.time() - self.cache_file.stat().st_mtime
+            if age < self.ttl:
+                try:
+                    self._data = json.loads(self.cache_file.read_text(encoding="utf-8"))
+                    if self._data: return
+                except (json.JSONDecodeError, OSError):
+                    pass
+        self._refresh()
+
+    def _refresh(self):
+        data = {}
+        if self.source_file.exists():
+            try:
+                raw = json.loads(self.source_file.read_text(encoding="utf-8"))
+                for tier_key in ["tier_1", "tier_2", "tier_3"]:
+                    tier = raw.get("gemini", {}).get(tier_key, [])
+                    if isinstance(tier, list):
+                        for m in tier:
+                            mid = m.get("model_id")
+                            if mid:
+                                data[mid] = {
+                                    "name": m.get("name"),
+                                    "pricing": m.get("pricing_per_1m_tokens", {})
+                                }
+            except (json.JSONDecodeError, OSError):
+                pass
+        if not data:
+            for mid, pricing in _MODEL_PRICING.items():
+                if mid != "default":
+                    data[mid] = {"name": mid, "pricing": pricing}
+        self._data = data
+        self._save_cache()
+
+    def _save_cache(self):
+        try:
+            _ensure_dir(self.cache_dir)
+            temp_path = self.cache_file.with_suffix(".tmp")
+            with open(temp_path, "w", encoding="utf-8") as f:
+                json.dump(self._data, f, indent=2)
+            os.replace(temp_path, self.cache_file)
+        except Exception as e:
+            print(f"[bridge] Failed to save registry cache: {e}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -226,9 +302,19 @@ _MODEL_PRICING = {
 
 def _estimate_cost(input_tokens: int, output_tokens: int, model: str) -> dict:
     """Estimate USD cost based on token counts and model."""
-    pricing = _MODEL_PRICING.get(model, _MODEL_PRICING["default"])
-    input_cost = (input_tokens / 1_000_000) * pricing["input"]
-    output_cost = (output_tokens / 1_000_000) * pricing["output"]
+    registry = ModelRegistry()
+    pricing = registry.get_pricing(model)
+    
+    def get_val(p, key):
+        if key in p: return p[key]
+        alt = f"{key}_under_200k"
+        return p.get(alt, _MODEL_PRICING["default"].get(key, 0.0))
+
+    in_price = get_val(pricing, "input")
+    out_price = get_val(pricing, "output")
+    
+    input_cost = (input_tokens / 1_000_000) * in_price
+    output_cost = (output_tokens / 1_000_000) * out_price
     return {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
@@ -599,77 +685,101 @@ async def _run_acp(args: argparse.Namespace, prompt_text: str) -> Dict[str, Any]
     session_id: Optional[str] = None
 
     try:
-        async with spawn_agent_process(
-            client,
-            "gemini", "--acp", *extra_flags,
-            env=os.environ.copy(),
-        ) as (conn, proc):
-            # 1. Connect Phase (Isolated)
+        attempts = 0
+        max_attempts = 2 if args.model else 1
+        
+        while attempts < max_attempts:
+            attempts += 1
+            current_flags = list(extra_flags)
+            if attempts > 1:
+                print(f"[bridge] Warning: Model `{args.model}` failed. Falling back to automatic selection.", file=sys.stderr)
+                if "--model" in current_flags:
+                    idx = current_flags.index("--model")
+                    current_flags.pop(idx + 1)
+                    current_flags.pop(idx)
+
             try:
-                await asyncio.wait_for(
-                    conn.initialize(
-                        protocol_version=PROTOCOL_VERSION,
-                        client_capabilities=CAPABILITIES,
-                    ),
-                    timeout=60.0
-                )
-                
-                # Session: resume or new
-                if resume_id:
+                async with spawn_agent_process(
+                    client,
+                    "gemini", "--acp", *current_flags,
+                    env=os.environ.copy(),
+                ) as (conn, proc):
+                    # 1. Connect Phase (Isolated)
                     try:
                         await asyncio.wait_for(
-                            conn.load_session(
-                                cwd=cd.as_posix(),
-                                session_id=resume_id,
-                                mcp_servers=[],
+                            conn.initialize(
+                                protocol_version=PROTOCOL_VERSION,
+                                client_capabilities=CAPABILITIES,
                             ),
                             timeout=60.0
                         )
-                        session_id = resume_id
-                    except (RequestError, asyncio.TimeoutError):
-                        session = await asyncio.wait_for(
-                            conn.new_session(cwd=cd.as_posix(), mcp_servers=[]),
-                            timeout=60.0
-                        )
-                        session_id = session.session_id
-                        _save_session(session_path, project_path, session_id)
-                else:
-                    session = await asyncio.wait_for(
-                        conn.new_session(cwd=cd.as_posix(), mcp_servers=[]),
-                        timeout=60.0
-                    )
-                    session_id = session.session_id
-                    _save_session(session_path, project_path, session_id)
-            except asyncio.TimeoutError:
-                raise BridgeTimeoutError(TimeoutType.CONNECT, 60.0, 60.0)
+                        
+                        # Session: resume or new
+                        if resume_id:
+                            try:
+                                await asyncio.wait_for(
+                                    conn.load_session(
+                                        cwd=cd.as_posix(),
+                                        session_id=resume_id,
+                                        mcp_servers=[],
+                                    ),
+                                    timeout=60.0
+                                )
+                                session_id = resume_id
+                            except (RequestError, asyncio.TimeoutError):
+                                session = await asyncio.wait_for(
+                                    conn.new_session(cwd=cd.as_posix(), mcp_servers=[]),
+                                    timeout=60.0
+                                )
+                                session_id = session.session_id
+                                _save_session(session_path, project_path, session_id)
+                        else:
+                            session = await asyncio.wait_for(
+                                conn.new_session(cwd=cd.as_posix(), mcp_servers=[]),
+                                timeout=60.0
+                            )
+                            session_id = session.session_id
+                            _save_session(session_path, project_path, session_id)
+                    except asyncio.TimeoutError:
+                        raise BridgeTimeoutError(TimeoutType.CONNECT, 60.0, 60.0)
 
-            # 2. Progress Race (Prompt Phase)
-            watchdog_task = asyncio.create_task(watchdog.monitor())
-            prompt_task = asyncio.create_task(conn.prompt(
-                session_id=session_id,
-                prompt=[text_block(prompt_text)],
-            ))
-            
-            done, pending = await asyncio.wait(
-                [prompt_task, watchdog_task],
-                return_when=asyncio.FIRST_COMPLETED
-            )
-            
-            # Cleanup pending
-            for task in pending:
-                task.cancel()
-                try:
-                    await task
-                except (asyncio.CancelledError, Exception):
-                    pass
-            
-            if prompt_task in done:
-                response = await prompt_task
-                result["stop_reason"] = response.stop_reason
-                result["success"] = True
-            else:
-                # Watchdog won the race
-                await watchdog_task # Re-raises BridgeTimeoutError
+                    # 2. Progress Race (Prompt Phase)
+                    watchdog_task = asyncio.create_task(watchdog.monitor())
+                    prompt_task = asyncio.create_task(conn.prompt(
+                        session_id=session_id,
+                        prompt=[text_block(prompt_text)],
+                    ))
+                    
+                    done, pending = await asyncio.wait(
+                        [prompt_task, watchdog_task],
+                        return_when=asyncio.FIRST_COMPLETED
+                    )
+                    
+                    # Cleanup pending
+                    for task in pending:
+                        task.cancel()
+                        try:
+                            await task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                    
+                    if prompt_task in done:
+                        response = await prompt_task
+                        result["stop_reason"] = response.stop_reason
+                        result["success"] = True
+                        break # Success!
+                    else:
+                        # Watchdog won the race
+                        await watchdog_task # Re-raises BridgeTimeoutError
+
+            except (RequestError, asyncio.TimeoutError) as e:
+                # Check if this is a ModelNotFoundError (404) or unknown model error
+                error_msg = str(e).lower()
+                is_model_error = ("model" in error_msg or "entity" in error_msg) and ("not found" in error_msg or "invalid" in error_msg or "404" in error_msg)
+                
+                if attempts < max_attempts and is_model_error:
+                    continue # Retry without model
+                raise # Permanent failure
 
     except BridgeTimeoutError as e:
         result["success"] = False
