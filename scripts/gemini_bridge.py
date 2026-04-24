@@ -204,14 +204,7 @@ def _ensure_dir(path: Path, mode: int = 0o700) -> Path:
 
 
 def _cache_key(prompt: str, cwd: str, model: str) -> str:
-    """Content-addressed key: hash of (git HEAD + dirty state + model + prompt).
-
-    Auto-invalidates when:
-    - The prompt changes (different task)
-    - Any commit is made (git HEAD changes)
-    - Any tracked file is modified without committing (dirty tree)
-    - A different model is requested (Flash vs Pro produce different results)
-    """
+    """Content-addressed key: hash of (git HEAD + dirty state + model + prompt)."""
     try:
         head = _subprocess.check_output(
             ["git", "rev-parse", "HEAD"],
@@ -219,17 +212,40 @@ def _cache_key(prompt: str, cwd: str, model: str) -> str:
         ).strip()
     except (_subprocess.CalledProcessError, FileNotFoundError):
         head = "no-git"
-    # Include dirty-tree signal so uncommitted edits bust the cache
+
     try:
-        dirty = _subprocess.check_output(
-            ["git", "diff", "--stat"],
+        diff = _subprocess.check_output(
+            ["git", "diff"],
             cwd=cwd, text=True, stderr=_subprocess.DEVNULL
-        ).strip()
+        )
+        status = _subprocess.check_output(
+            ["git", "status", "--porcelain"],
+            cwd=cwd, text=True, stderr=_subprocess.DEVNULL
+        )
+        untracked_files = _subprocess.check_output(
+            ["git", "ls-files", "--others", "--exclude-standard"],
+            cwd=cwd, text=True, stderr=_subprocess.DEVNULL
+        ).splitlines()
+        
+        untracked_stats = []
+        for f in untracked_files:
+            try:
+                fpath = Path(cwd) / f
+                if fpath.exists():
+                    st = fpath.stat()
+                    untracked_stats.append(f"{f}:{st.st_size}:{st.st_mtime}")
+            except Exception:
+                pass
+        
+        dirty_signal = f"{diff}\n{status}\n" + "\n".join(untracked_stats)
     except (_subprocess.CalledProcessError, FileNotFoundError):
-        dirty = ""
-    dirty_hash = hashlib.sha256(dirty.encode("utf-8")).hexdigest()[:8] if dirty else "clean"
+        dirty_signal = "no-git-status"
+
+    dirty_hash = hashlib.sha256(dirty_signal.encode("utf-8")).hexdigest()[:16]
     composite = f"{head}\n{dirty_hash}\n{model}\n{prompt}"
     return hashlib.sha256(composite.encode("utf-8")).hexdigest()[:32]
+
+
 
 
 def _cache_lookup(cache_dir: Path, key: str, cache_ttl: int) -> Optional[Dict[str, Any]]:
@@ -487,6 +503,7 @@ class BridgeClient:
         self._tool_calls: List[Dict[str, Any]] = []
         self._plan: List[Dict[str, Any]] = []
         self._all_messages: List[Any] = []
+        self.read_file_count = 0
 
     def _check_path_containment(self, path: str) -> Path:
         resolved = Path(path).resolve()
@@ -503,6 +520,7 @@ class BridgeClient:
     async def read_text_file(self, path: str, session_id: str, limit: Optional[int] = None, line: Optional[int] = None, **kwargs) -> ReadTextFileResponse:
         resolved = self._check_path_containment(path)
         content = resolved.read_text(encoding="utf-8")
+        self.read_file_count += 1
         return ReadTextFileResponse(content=content)
 
     async def write_text_file(self, content: str, path: str, session_id: str, **kwargs) -> WriteTextFileResponse:
@@ -684,6 +702,10 @@ async def _run_acp(args: argparse.Namespace, prompt_text: str) -> Dict[str, Any]
     result: Dict[str, Any] = {}
     session_id: Optional[str] = None
 
+    fallback_occurred = False
+    requested_model = args.model
+    actual_model_selection = "specified" if args.model else "automatic"
+
     try:
         attempts = 0
         max_attempts = 2 if args.model else 1
@@ -692,6 +714,8 @@ async def _run_acp(args: argparse.Namespace, prompt_text: str) -> Dict[str, Any]
             attempts += 1
             current_flags = list(extra_flags)
             if attempts > 1:
+                fallback_occurred = True
+                actual_model_selection = "automatic"
                 print(f"[bridge] Warning: Model `{args.model}` failed. Falling back to automatic selection.", file=sys.stderr)
                 if "--model" in current_flags:
                     idx = current_flags.index("--model")
@@ -814,6 +838,10 @@ async def _run_acp(args: argparse.Namespace, prompt_text: str) -> Dict[str, Any]
         result["SESSION_ID"] = session_id
     result["agent_messages"] = client._agent_messages
     result["tool_calls"] = client._tool_calls
+    result["read_file_count"] = client.read_file_count
+    result["fallback_occurred"] = fallback_occurred
+    result["requested_model"] = requested_model
+    result["actual_model_selection"] = actual_model_selection
     # Token estimation
     input_tokens = _estimate_tokens(prompt_text)
     output_tokens = _estimate_tokens(client._agent_messages)

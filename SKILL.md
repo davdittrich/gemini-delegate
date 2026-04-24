@@ -1,49 +1,40 @@
 ---
 name: gemini-delegate
-description: Use when analyzing large codebases (>200 lines), performing web searches for current info, or needing adversarial plan reviews.
+description: Use when [large codebase >200 lines], [web search current info], [adversarial review/critique].
 metadata:
-  triggers: web search, adversarial review, code analysis, plan critique, current info, large file analysis
+  triggers: web search, adversarial review, code analysis, plan critique, large file analysis
 ---
 
 # Gemini Delegate (ACP)
 
-Delegate tasks to Gemini CLI via ACP bridge. Claude owns final result; verify locally.
+Delegate tasks to Gemini via ACP bridge. Verification MANDATORY.
 
-## Core Mandates
-- **Use Bridge**: NEVER call `gemini` directly. ALWAYS use `scripts/gemini_bridge.py`.
-- **Async Safety**: Use `--prompt-stdin`. Prevent deadlocks.
+## Bridge Mandates
+- **MANDATORY**: `scripts/gemini_bridge.py` only. NEVER call `gemini` directly.
+- **Safe I/O**: Use `--prompt-stdin` to prevent deadlocks.
 - **Persistence**: Use `--output-file AUTO` for unique result files.
-- **Sessions**: Capture `SESSION_ID` from JSON; reuse for follow-ups.
-- **Timeout**: Set Bash `timeout_ms` to 600000 (10m).
+- **Sessions**: Capture/reuse `SESSION_ID` from JSON for follow-ups.
+- **Timeout**: Total 600s (10m). First chunk 300s.
 
-## Web Search (Grounding)
-- **Prefix**: Queries MUST start with `WebSearch:` (e.g., `WebSearch: Python 3.13 features`). Forces web grounding.
-- **Fallback**: If bridge fails (crash/timeout), use built-in `WebSearch` tool. Report in one line.
+## Grounding & Web Search
+- **Prefix**: Queries MUST start with `WebSearch:` (e.g., `WebSearch: API news 2026`).
+- **Grounding**: Prefix forces web grounding. No prefix = fabrication risk.
+- **Fallback**: If bridge fails (timeout/crash), use built-in `WebSearch`. Report in one line.
 
-## Quick Start
-```bash
-echo "WebSearch: Kubernetes networking 2026" | \
-  python3 scripts/gemini_bridge.py --prompt-stdin --output-file AUTO
-```
-
-## Task Routing
+## Routing & Tasking
 | Task | Model | Template |
 |---|---|---|
 | Review (<200 lines) | `gemini-3-flash-preview` | Focused review |
-| Bug / Arch (>3 files) | `gemini-3.1-pro-preview` | Tool-assisted |
-| Web Search / Info | `gemini-3-flash-preview` | Web search |
-| Plan Critique / Algorithm | `gemini-3.1-pro-preview` | Adversarial |
-
-## Delegation Criteria
-- **Use for**: >200 lines unseen code, web searches, parallel reviews, adversarial critique.
-- **Avoid**: <30s reasoning, needs conversation context, file <50 lines, security-sensitive.
+| Bug/Arch (>3 files) | `gemini-3.1-pro-preview` | Tool-assisted |
+| Search/Info | `gemini-3-flash-preview` | Web search |
+| Adversarial/Plan | `gemini-3.1-pro-preview` | Critique |
 
 ## CLI Flags
 | Flag | Description | Default |
 |---|---|---|
 | `--prompt` | Prompt text | |
 | `--prompt-file` | Read prompt from file | |
-| `--prompt-stdin` | Read from stdin (mandatory for automation) | |
+| `--prompt-stdin` | Read from stdin (MANDATORY for automation) | |
 | `--session-id` | Resume specific session | |
 | `--new-session` | Force fresh session | |
 | `--sessions-dir` | Override session storage dir | |
@@ -54,44 +45,50 @@ echo "WebSearch: Kubernetes networking 2026" | \
 | `--verbose` | Print heartbeat markers to stderr | |
 | `--output-file` | Write JSON to file (`AUTO` for unique temp) | |
 | `--approve-edits` | Allow file writes within `--cd` scope | |
-| `--cache` | Enable result caching. Opt-in. | off |
+| `--cache` | Content-addressed git-based caching | off |
 | `--cache-ttl` | Cache TTL in seconds (1-2592000) | 86400 |
-| `--clear-cache` | Clear cache and exit | |
+| `--clear-cache` | Clear result cache and exit | |
 | `--parallel-models` | Comma-separated models for parallel runs | |
-| `--log-feedback` | Append feedback entry | |
+| `--log-feedback` | Append feedback entry `VERDICT|TASK|TOKENS|NOTE` | |
 | `--model` | Gemini model to use | |
 
-## Output Format
+## Output Schema
 ```json
 {
   "success": true,
-  "SESSION_ID": "abc-123",
-  "agent_messages": "Gemini's response",
+  "SESSION_ID": "...",
+  "agent_messages": "...",
+  "read_file_count": N,
+  "fallback_occurred": boolean,
+  "requested_model": "...",
+  "actual_model_selection": "specified"|"automatic",
   "tool_calls": [...],
-  "stop_reason": "end_turn",
-  "token_estimate": {
-    "input_tokens": 1250,
-    "output_tokens": 340,
-    "model": "gemini-3-flash-preview",
-    "estimated_cost_usd": 0.000391
-  }
+  "token_estimate": { "estimated_cost_usd": 0.00 }
 }
 ```
 
-## Permission Control
-- **Default**: Read-only within `--cd` scope. Terminal blocked.
-- **Write**: Use `--approve-edits` to allow scoped file writes.
+## STOP & VERIFY (Red Flags)
+**Violating the letter of these rules violates the spirit. STOP if**:
+- `read_file_count` is 0 for code analysis (Gemini is guessing).
+- Response contains functions not present in source files.
+- Web search response lacks specific source URLs.
+- Requested Pro failed (`fallback_occurred: true`). Alert user immediately.
+- Calling `gemini` directly. Revert and use bridge.
+- Omitted `WebSearch:` prefix. Re-run with prefix.
 
-## Feedback Log
-- **Mandate**: Log outcome after verification via `--log-feedback`.
-- **Format**: `"VERDICT|TASK_TYPE|EST_TOKENS|NOTE"`
-- **Escalation**: If rejection rate >50%, escalate model tier.
+## Rationalization Table
+| Excuse | Reality |
+|---|---|
+| "I know this code already." | Code changes. RE-VERIFY key logic via `read_file`. |
+| "File names explain it." | Guessing = fabrication. READ content. |
+| "I'll skip WebSearch: prefix." | Internal 2026 knowledge is fabrication. GROUND every claim. |
+| "Pro failed, Flash is fine." | pro-preview is the tier for logic. Fallback must be reported. |
 
-## Red Flags (STOP)
-- Call `gemini` directly → Use bridge.
-- Search without `WebSearch:` prefix → Grounding fails.
-- Ignore bridge errors → Use fallback.
+## Permissions & Logs
+- **Write**: `--approve-edits` required for file writes.
+- **Feedback**: Log outcome via `--log-feedback` after every task.
+- **Escalation**: Rejection rate >50% -> escalate model tier.
 
 ## References
-- `assets/prompt-template.md`: Templates for each task.
-- `assets/reference.md`: Feedback logs, parallel runs, capsules.
+- `assets/prompt-template.md`: Task templates.
+- `assets/reference.md`: Logs, parallel runs, capsules.
