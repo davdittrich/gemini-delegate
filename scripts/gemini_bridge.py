@@ -520,7 +520,8 @@ class BridgeClient:
     async def read_text_file(self, path: str, session_id: str, limit: Optional[int] = None, line: Optional[int] = None, **kwargs) -> ReadTextFileResponse:
         resolved = self._check_path_containment(path)
         content = resolved.read_text(encoding="utf-8")
-        self.read_file_count += 1
+        # NOTE: read_file_count increment is now handled in session_update via ToolCallStart
+        # to capture both client-provided and agent-internal tools.
         return ReadTextFileResponse(content=content)
 
     async def write_text_file(self, content: str, path: str, session_id: str, **kwargs) -> WriteTextFileResponse:
@@ -531,13 +532,7 @@ class BridgeClient:
                 "reason": "Write denied: --approve-edits not set",
             })
         resolved.write_text(content, encoding="utf-8")
-        self._tool_calls.append({
-            "id": f"write-{len(self._tool_calls)}",
-            "title": f"Write {path}",
-            "type": "write_file",
-            "status": "completed",
-            "path": path,
-        })
+        # Notification will come via session_update
         return WriteTextFileResponse()
 
     async def request_permission(self, options, session_id: str, tool_call=None, **kwargs) -> RequestPermissionResponse:
@@ -583,13 +578,19 @@ class BridgeClient:
             path = None
             if update.locations:
                 path = update.locations[0].path
+            
+            tc_type = self._classify_tool_call(update)
             self._tool_calls.append({
                 "id": update.tool_call_id,
                 "title": update.title or "",
-                "type": self._classify_tool_call(update),
+                "type": tc_type,
                 "status": getattr(update, "status", "pending"),
                 "path": path,
             })
+            
+            if tc_type == "read_file":
+                self.read_file_count += 1
+                
             if self._watchdog: self._watchdog.activity("ToolCallStart")
         elif isinstance(update, ToolCallUpdate):
             for tc in self._tool_calls:
@@ -604,11 +605,26 @@ class BridgeClient:
             ]
 
     def _classify_tool_call(self, tc: ToolCallStart) -> str:
+        ident = (tc.tool_call_id or "").lower()
         title = (tc.title or "").lower()
-        if "read" in title and "file" in title:
+        
+        # Tools that count as "reading" or "exploration"
+        read_tools = ["read_file", "read_text_file", "list_directory", "glob", "grep_search", "read_multiple_files"]
+        read_indicators = ["read", "list", "glob", "grep"]
+        
+        # Check ID first as it's usually the tool name
+        if any(tool in ident for tool in read_tools):
             return "read_file"
-        if "write" in title or "edit" in title:
+            
+        # Fallback to title if ID doesn't match
+        if any(ind in title for ind in read_indicators):
+            # Exclude write operations
+            if "write" not in title and "edit" not in title:
+                return "read_file"
+        
+        if "write" in ident or "edit" in ident or "write" in title or "edit" in title:
             return "write_file"
+            
         return "unknown"
 
     # --- Terminal methods (all rejected/no-op) ---
