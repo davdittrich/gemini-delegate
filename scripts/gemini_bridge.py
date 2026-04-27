@@ -6,6 +6,7 @@ Communicates with Gemini CLI via the Agent Client Protocol (JSON-RPC 2.0 over st
 Replaces the previous stream-json transport with structured, typed communication.
 """
 
+import difflib
 import argparse
 import asyncio
 import copy
@@ -135,6 +136,12 @@ class ModelRegistry:
         if not self._data:
             self._load()
         return self._data
+
+    def suggest_model(self, model_id: str) -> Optional[str]:
+        """Return the closest matching model_id from the registry."""
+        models = list(self.get_models().keys())
+        matches = difflib.get_close_matches(model_id, models, n=1, cutoff=0.6)
+        return matches[0] if matches else None
 
     def get_pricing(self, model_id: str) -> Dict[str, float]:
         """Return pricing for a model, fallback to default if unknown."""
@@ -1060,12 +1067,36 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _validate_models(args: argparse.Namespace) -> List[str]:
+    """Check if requested models exist in the registry and return suggestions if not."""
+    registry = ModelRegistry()
+    known = registry.get_models()
+    warnings = []
+
+    to_check = []
+    if args.model:
+        to_check.append(("--model", args.model))
+    if args.parallel_models:
+        for m in args.parallel_models.split(","):
+            to_check.append(("--parallel-models", m.strip()))
+
+    for label, m_id in to_check:
+        if m_id and m_id not in known:
+            suggestion = registry.suggest_model(m_id)
+            msg = f"Unrecognized model in {label} `{m_id}`."
+            if suggestion:
+                msg += f" Did you mean `{suggestion}`?"
+            warnings.append(msg)
+    return warnings
+
+
 def main() -> None:
     if shutil.which("gemini") is None:
         print(json.dumps({"success": False, "error": "Gemini CLI not found in PATH."}))
         return
 
     args = _parse_args()
+    model_warnings = _validate_models(args)
 
     # --- Canonical argument validation (covers all early-exit flags) ---
     has_prompt = bool(args.prompt or args.prompt_file or args.prompt_stdin)
@@ -1116,8 +1147,11 @@ def main() -> None:
         result = asyncio.run(_run_parallel(args, prompt_text))
     else:
         result = asyncio.run(_run_acp(args, prompt_text))
+    
+    if model_warnings:
+        result["model_warnings"] = model_warnings
+    
     _emit(result, args)
-
 
 if __name__ == "__main__":
     main()
