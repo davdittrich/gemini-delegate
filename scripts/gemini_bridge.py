@@ -25,22 +25,29 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from acp import spawn_agent_process, text_block, PROTOCOL_VERSION, RequestError
-from acp.schema import (
-    ClientCapabilities,
-    FileSystemCapabilities,
-    RequestPermissionResponse,
-    AllowedOutcome,
-    DeniedOutcome,
-    ReadTextFileResponse,
-    WriteTextFileResponse,
-    AgentMessageChunk,
-    AgentThoughtChunk,
-    AgentPlanUpdate,
-    ToolCallStart,
-    ToolCallUpdate,
-    TextContentBlock,
-)
+try:
+    from acp import spawn_agent_process, text_block, PROTOCOL_VERSION, RequestError
+    from acp.schema import (
+        ClientCapabilities,
+        FileSystemCapabilities,
+        RequestPermissionResponse,
+        AllowedOutcome,
+        DeniedOutcome,
+        ReadTextFileResponse,
+        WriteTextFileResponse,
+        AgentMessageChunk,
+        AgentThoughtChunk,
+        AgentPlanUpdate,
+        ToolCallStart,
+        ToolCallUpdate,
+        TextContentBlock,
+    )
+except ImportError as e:
+    print(json.dumps({
+        "success": False,
+        "error": f"Missing dependency: {e}. Please run 'pip install -r requirements.txt'.",
+    }))
+    sys.exit(0)
 
 # ---------------------------------------------------------------------------
 # Timeouts and Watchdog
